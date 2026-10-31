@@ -880,8 +880,11 @@ static int register_against_all_libs(zygisk::Api *api, bool guard) {
 // read()/openat() would break every app instead of staying transparent.
 struct SymSlot { const char *name; void **slot; };
 
-static void fill_missing_orig() {
-    static SymSlot slots[] = {
+// Kept at namespace scope on purpose: a function-local array whose elements
+// hold the addresses of globals needs a dynamic initializer, and with
+// APP_STL := none that pulls in __cxa_guard_acquire/__cxa_guard_release,
+// which nothing provides.
+static const SymSlot kSymSlots[] = {
         {"open",                       (void **)&orig_open},
         {"open64",                     (void **)&orig_open64},
         {"openat",                     (void **)&orig_openat},
@@ -920,10 +923,12 @@ static void fill_missing_orig() {
         {"security_compute_av_flags",  (void **)&orig_security_compute_av_flags},
         {"selinux_check_access",       (void **)&orig_selinux_check_access},
         {nullptr, nullptr},
-    };
-    for (int i = 0; slots[i].name; ++i) {
-        if (*slots[i].slot) continue;
-        *slots[i].slot = dlsym(RTLD_DEFAULT, slots[i].name);
+};
+
+static void fill_missing_orig() {
+    for (int i = 0; kSymSlots[i].name; ++i) {
+        if (*kSymSlots[i].slot) continue;
+        *kSymSlots[i].slot = dlsym(RTLD_DEFAULT, kSymSlots[i].name);
     }
 }
 
