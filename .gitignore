@@ -1,6 +1,24 @@
 *.zip
 *.so
+*.ko
 tmp/
 build/
 dist/
 __pycache__/
+.kernel/
+.kout/
+.uploads/
+
+# kernel module build products
+kmod/*.o
+kmod/*.mod
+kmod/*.mod.c
+kmod/*.cmd
+kmod/.*.cmd
+kmod/Module.symvers
+kmod/modules.order
+kmod/.Module.symvers.cmd
+kmod/.modules.order.cmd
+kmod/*.ko
+kmod/*.ko.*
+kmod/.tmp_versions/

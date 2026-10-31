@@ -1,7 +1,7 @@
 id=dirtysepbypass
 name=DirtySepolicy Bypass
-version=v4.2.1
-versionCode=42010
-author=local
-description=Defeats DirtySepolicy up to v2.2 and the Duck-Detector probe set. Intercepts selinuxfs access/status/context/policy and libselinux APIs, serves scrubbed /proc/{self,thread-self,<pid>}/maps/smaps/smaps_rollup/status/comm/stat/sched/mountinfo/mounts/environ, linker solists, fd links and env vars so ordinary apps cannot find the Zygisk injection, blocks same-uid cross-process /proc reads (forked cat, process_vm_readv, ptrace) by re-clearing PR_SET_DUMPABLE after specialization while keeping stock stat/prctl answers, and drops leaking AVC audit records from __android_log_* and logcat streams (ZN-AuditPatch style, without ZygiskNext).
+version=v5.0.0
+versionCode=50000
+author=SHuiTU68
+description=Kernel-side hiding (no Zygisk): a small kprobe LKM hides Magisk/LSPosed/KernelSU/APatch SELinux contexts, fakes selinuxfs access answers and drops root-managed mount lines for ordinary apps. Nothing is injected into app, zygote or app_zygote processes, so isolated probes are covered too. Requires an arm64 device whose kernel allows kretprobes and unsigned module loading (OnePlus MT6991 / 6.6 GKI).
 updateJson=

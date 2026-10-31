@@ -10,31 +10,50 @@ on:
 permissions:
   contents: write
 
+env:
+  # The module has to match the KMI of this exact kernel; keep it in sync with
+  # the default in tools/build.sh.
+  KERNEL_SHA: 1d453aabd9c290bc7d185626b9542eae1cf0b1f6
+
 jobs:
   module:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure Android NDK
+      - name: Install LLVM and kernel build dependencies
         run: |
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "${ANDROID_NDK_HOME:-}" ]; then
-            NDK_DIR="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
-            if [ -n "$NDK_DIR" ]; then
-              echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-            else
-              yes | sdkmanager --licenses >/dev/null 2>&1 || true
-              sdkmanager --install "ndk;26.1.10909125"
-              echo "ANDROID_NDK_HOME=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
-            fi
-          fi
-          echo "Using NDK: ${ANDROID_NDK_HOME:-$SDK/ndk}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm make bc flex bison libelf-dev libssl-dev \
+            dwarves python3 curl zstd
 
-      - name: Build all ABIs and package zip
+      # modules_prepare costs a couple of minutes; the source tree itself is
+      # cheaper to download again than to cache (1.5 GiB extracted).
+      - name: Cache prepared kernel headers
+        uses: actions/cache@v4
+        with:
+          path: .kout
+          key: kout-${{ env.KERNEL_SHA }}-v1
+
+      - name: Build dsb_kmod.ko and package the module zip
         run: |
           chmod +x tools/build.sh
           ./tools/build.sh
+
+      - name: Inspect the zip
+        run: |
+          ls -l dist/
+          python3 - <<'PY'
+          import glob
+          import zipfile
+          for path in glob.glob("dist/*.zip"):
+              with zipfile.ZipFile(path) as zf:
+                  print(path)
+                  for info in zf.infolist():
+                      print("  %s %7d %s" % (oct(info.external_attr >> 16),
+                                             info.file_size, info.filename))
+          PY
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4

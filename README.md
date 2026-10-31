@@ -2,289 +2,206 @@
 
 <div align="center">
 
-![Downloads](https://img.shields.io/github/downloads/flipphoneguy/DirtySepolicy_Bypass/total)
+![Downloads](https://img.shields.io/github/downloads/SHuiTU68/DirtySepolicy_Bypass/total)
 
 </div>
 
-Zygisk module that defeats [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy)
-up to v2.2, any detector using the same App-Zygote SELinux-probe technique, and
-the SELinux / Zygisk / audit surfaces exercised by
-[Duck-Detector](https://github.com/eltavine/Duck-Detector-Refactoring).
+从 v5.0.0 开始，本模块**不再使用 Zygisk 注入**，改为一个可加载内核模块
+（`dsb_kmod.ko`，由 Magisk 在 `post-fs-data` 阶段 `insmod`）。隐藏逻辑放在
+内核里，探测应用无论用什么手段（原生 `syscall`、隔离进程、`app_zygote`
+载体、直接读 `selinuxfs`）都得经过这些内核函数，因此覆盖面比进程内 PLT
+hook 完整得多。
 
-## Detection vectors covered
+模块面向 **arm64、6.6 GKI 内核**（已在 OnePlus MT6991 /
+`oneplus/mt6991_b_16.0.0_oneplus_ace5_ultra` 的
+`6.6.118-4k-g1d453aabd9c2` 上构建验证），针对
+[LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) 与
+[Duck-Detector](https://github.com/eltavine/Duck-Detector-Refactoring) 暴露的
+SELinux / 挂载表检测项。
 
-DirtySepolicy v2.2 probes from inside App Zygote:
+## 为什么放弃 Zygisk
 
-1. **`contextExists()`** — writes context strings to `/sys/fs/selinux/context`,
-   queries `/sys/fs/selinux/access`, then `/proc/self/attr/current`.
-2. **`checkSELinuxAccess()`** — resolves class/perm ids from
-   `/sys/fs/selinux/class/` and queries `/sys/fs/selinux/access` directly.
-3. **`readStatus()` / `avdSeqNo`** — reads `/sys/fs/selinux/status` counters
-   and the `seqno` field of `access` responses to spot policy reloads.
-4. **Indirect stock-context probes** — allow rules between stock contexts that
-   only exist after a framework injected them.
+上传的 Duck-Detector 报告（`PLC110`，2026-10-31）说明了进程内方案的边界：
 
-Duck-Detector adds:
-
-- **Dirty-policy oracles** — `fsck_untrusted sys_admin`, `adbd → adbroot`,
-  `untrusted_app → magisk/ksu/lsposed/xposed`, `droidspacesd`, `msd_app`,
-  `msd_daemon`, `zygote → adb_data_file`, rootfs/kernel tmpfs rules, …
-- **SELinux integrity probes** — `mmap` of `/sys/fs/selinux/status`,
-  `avc/cache_stats` lookup counters, `attr/current` timing.
-- **Audit integrity probes** — parses `logcat -b events` for `type=1400 avc:
-  denied` records, actor names (`su/magisk/ksud/…`), ZN-AuditPatch markers
-  (`zn-auditpatch`, `libauditpatch.so`, `logd PLT hook success`) and the fake
-  `tcontext=u:r:priv_app:s0:c512,c768`.
-- **Zygisk injection probes** — `dl_iterate_phdr` solist/namespaces,
-  `/proc/self/{maps,smaps,status,fd,task}`, environment variables, deleted
-  fd traps, heap entropy, atexit tables.
-
-## Hook table
-
-| Hook | Target | Effect |
-|---|---|---|
-| `open`/`open64`/`openat`/`openat64` | selinuxfs `access`, `context`, `status`, `policy`, `avc/cache_stats` | Track and classify fds |
-| `write` | `access`, `context`, `/proc/*/attr/*` | Block hidden-context writes, stash access queries |
-| `read`/`pread64` | `access` | Mask hidden permission bits, exact probes, force `decided=0xffffffff` and `seqno=1` |
-| `read` | `status` | Rewrite `sequence` / `policyload` for the kernel baseline |
-| `read`/`pread64` | `policy` | Erase framework strings from the binary policy blob |
-| `read`/`pread64` | `avc/cache_stats` | Zero lookup/hit/miss counters |
-| `mmap`/`mmap64` | `status` | Return `EACCES` (blocks the mmap-ABI probe) |
-| `open`/`open64`/`openat`/`openat64`/`fopen`/`fopen64` | `/proc/{self,thread-self,<own-pid>}/{maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,mountstats,environ}`, `task/<tid>/*` | Serve a scrubbed anonymous memfd copy |
-| `readlink`/`readlinkat` | `/proc/self/fd/*` | `ENOENT` for module/deleted `.so` targets |
-| `dl_iterate_phdr` | linker solist | Hide module entries |
-| `prctl` / `syscall(__NR_prctl)` | `PR_GET_DUMPABLE` | Report the stock value after the profileable clear (answer `1` only when we changed it) |
-| `stat`/`lstat`/`fstat`/`fstatat`/`statx` (+64-bit variants) | own `/proc/<pid>` subtree | Rewrite `st_uid`/`st_gid` / `stx_uid`/`stx_gid` to the app uid (profileable case only) |
-| `getenv`/`secure_getenv` | `TMP_PATH`, `MAGISK*`, `ZYGISK*`, … | Return `NULL` |
-| `__android_log_write/buf_write/print/vprint` | AVC audit records | Drop leaking lines at the source |
-| `read`/`pread64` (≤8 KiB) | logcat-style streams | Drop leaking AVC lines that come back |
-| `selinux_check_access` / `security_compute_av(_flags)` | libselinux API | Same masking, for library-based detectors |
-
-Hooks are installed with Zygisk PLT hooking, but only on the libraries that
-actually host the probes: `libjavacore.so`, `libandroid_runtime.so`,
-`libselinux.so`, `libnativehelper.so` and the app's own libraries under
-`/data/app/`. Each `(dev, ino)` pair is registered once (a `.so` shows up as
-three or four maps segments) and the total is budgeted, because Zygisk
-providers keep a fixed-size pending-hook table. `system_server` (uid 1000) is
-left completely untouched — it maps the largest library set, and one bad hook
-there kills system_server, which takes zygote and the whole boot down with it.
-App zygotes (uid ≥ 10000), where DirtySepolicy actually probes from, are hooked.
-
-## Hidden type patterns (`jni/rules.h`)
-
-| Pattern | Catches |
+| 报告里的现象 | 进程内 hook 为什么挡不住 |
 |---|---|
-| `:magisk` | `magisk`, `magisk_file`, `magisk_log_file`, `magisk32`, ... |
-| `:kitsune` | KitsuneMask types |
-| `:apatch` | APatch types |
-| `:ksu` / `:kernelsu` | KernelSU types |
-| `:lsposed` | `lsposed_file`, any `lsposed_*` |
-| `:xposed` | `xposed_data`, `xposed_file`, any `xposed_*` |
-| `:riru` | `riru_file`, any `riru_*` |
-| `:adbroot` | `adbroot`, `adbroot_exec`, `adbroot_data_file` |
-| `:supersu` / `:supolicy` | SuperSU legacy types |
-| `:su:` | AOSP `u:r:su:s0` (trailing colon avoids false positives) |
-| `:zygisk` / `:zygisknext` / `:zygisksu` / `:neozygisk` / `:rezygisk` | Zygisk variants |
-| `:shamiko` | Shamiko artifacts |
-| `:droidspacesd` / `:msd_app` / `:msd_daemon` | Duck-Detector custom domains |
-| `:auditpatch` | ZN-AuditPatch residue types |
+| SELinux 上下文被识别为 `CONTEXT_RECOGNIZED` | 探测跑在 `app_zygote` 的隔离载体里，Zygisk 根本没有注入；并且它用原生 `open/write/read` 直读 `selinuxfs`，不经过 libselinux 的 PLT |
+| `raw access` 出现 7 条"脏边"（rootfs→tmpfs、kernel→tmpfs、system_server→apk_data_file …） | `access` 的应答由内核 `sel_write_access` 生成，用户态只能改自己进程里读到的内容，改不了另一个进程 |
+| Mount `DANGER`：`source=magisk`、`/debug_ramdisk`、`/adb/modules/PUIThemeCustomized/…` | `/proc/<pid>/mountinfo` 是全局视图，注入不到的应用照样能看到 |
+| Memory `DANGER`：匿名可执行映射、`maps` 里的 `zygisk/arm64-v8a.so` | 后者是 Zygisk 自身的产物，去掉注入即消失 |
 
-## Exact-match probe table
+结论：要在**所有**探测路径上一致地隐藏，必须在内核侧做。
 
-| scon | tcon | class | perm | Detects |
-|---|---|---|---|---|
-| `rootfs` | `tmpfs` | `filesystem` | `associate` | Magisk |
-| `kernel` | `tmpfs` | `fifo_file` | `open` | Magisk |
-| `kernel` | `adb_data_file` | `file` | `read` | KernelSU |
-| `system_server` | `apk_data_file` | `file` | `execute` | LSPosed |
-| `dex2oat` | `dex2oat_exec` | `file` | `execute_no_trans` | Xposed |
-| `zygote` | `adb_data_file` | `dir` | `search` | ZygiskNext |
-| `fsck_untrusted` | `fsck_untrusted` | `capability` | `sys_admin` | Duck dirty-policy |
+## 架构
 
-## Zygisk injection hiding
+`kmod/dsb_kmod.c` 安装 6 个 kretprobe，全部只对 **uid ≥ 10000** 的调用者
+生效（普通应用、隔离进程 `90000+`、`app_zygote` 子进程都在内），root
+（0）、shell（2000）、system（1000）与所有系统服务保持原样，框架照常运行。
 
-`jni/stealth.cpp` makes the injected library invisible to a normal app:
+| # | 目标函数 | 动作 |
+|---|---|---|
+| 1 | `security_context_to_sid` | 命中隐藏上下文时把成功（0）改成 `-EINVAL` |
+| 2 | `selinux_setprocattr` | 写 `/proc/<pid>/attr/current` 命中隐藏上下文时返回 `-EINVAL` |
+| 3 | `sel_write_context` | 写 `/sys/fs/selinux/context` 命中隐藏上下文时返回 `-EINVAL` |
+| 4 | `sel_write_access` | 查询涉及隐藏上下文或脏边时，把 `access` 的六字段应答重写为全拒绝 |
+| 5 | `show_mountinfo` | `/proc/<pid>/mountinfo` 命中隐藏挂载的行整行丢弃 |
+| 6 | `show_vfsmnt` | `/proc/<pid>/mounts` 同上 |
 
-- `/proc/{self,thread-self,<own-pid>}/maps`, `smaps`, `smaps_rollup`,
-  `status`, `comm`, `task/<tid>/maps`, `stat`, `sched`, `mountinfo`, `mounts`,
-  `mountstats` and `environ` are served from an anonymous `memfd:jit-cache`
-  copy. Module paths are removed, `TracerPid` is zeroed and thread names that
-  expose a framework (`su`, `magiskd`, `zygisk…`) are rewritten to
-  `zygote64`. `environ` is NUL-separated and filtered entry by entry.
-- The literal pid and `/proc/thread-self` are recognised as aliases of
-  `/proc/self`, so `open("/proc/<getpid()>/maps")` gets the same scrubbed copy.
-- `dl_iterate_phdr` entries pointing at `/data/adb`, `magisk`, `zygisk`,
-  `lsposed`, … are skipped.
-- `readlink`/`readlinkat` return `ENOENT` for module or deleted-`.so` targets.
-- `getenv`/`secure_getenv` hide `TMP_PATH`, `MAGISK*`, `ZYGISK*`, `KSU*`, …
-- Framework names are matched only in the final path component or a
-  `[bracket]` mapping annotation, so an app whose own package path contains
-  `magisk`/`lsposed` is not scrubbed out of its own maps.
-- **Cross-process readers are blocked at the kernel gate.** PLT hooks only
-  cover this process, so a detector could fork a helper
-  (`Runtime.exec("cat /proc/<our-pid>/maps")`) or use `process_vm_readv` /
-  `PTRACE_ATTACH` from the same uid. `ptrace_may_access()` refuses those unless
-  the target is dumpable. AOSP's zygote already makes ordinary apps
-  non-dumpable: `SpecializeCommon` runs `setresuid()`, which resets the flag to
-  `/proc/sys/fs/suid_dumpable` (0), and forces 0 explicitly when that sysctl is
-  2. That is stock behaviour, so for a normal app the module changes nothing —
-  the root-owned `/proc/<pid>` inodes and `PR_GET_DUMPABLE == 0` stay exactly
-  as stock. The only gap is `PROFILE_FROM_SHELL` (profileable) apps, where
-  zygote raises `PR_SET_DUMPABLE` back to 1; `guard_process()` runs in
-  `postAppSpecialize` (a `preAppSpecialize` clear would be overwritten by
-  specialization) and clears it again. Only when the flag really changed from
-  the user-dumpable state are the side effects masked: the stat family (including
-  `statx`) rewrites the now root-owned `/proc/<pid>` inodes back to the app uid,
-  and both `prctl(PR_GET_DUMPABLE)` and `syscall(__NR_prctl, ...)` answer `1`.
-  Root/CAP_SYS_PTRACE readers (debuggerd, tombstones, `dumpsys`) still work.
-  Debuggable apps (`runtime_flags & DEBUG_ENABLE_DEBUGGER`) are skipped so
-  native/JDWP debugging keeps working. The spoof hooks (`prctl`, `syscall`,
-  stat family, `statx`) are registered in the same single `pltHookCommit()`
-  batch as the rest (a second commit is not portable across Zygisk providers),
-  but they are only registered for ordinary apps and they forward untouched
-  until `guard_process()` signals that it really cleared the flag.
+### 上下文"不存在"比"存在但被拒"更安全
 
-Scrubbing is enabled **only for ordinary, non-root app processes** (uid ≥
-10000 and without `PROCESS_GRANTED_ROOT`), and the hooks only reach ordinary
-apps and app zygotes. Root-granted apps and `system_server` are not
-instrumented at all, so they keep the real `/data/adb` mappings, fd targets,
-linker solist and a pristine log path; root tooling and the shell are
-unaffected.
+`/sys/fs/selinux/context` 与 `/proc/<pid>/attr/current` 对合法但被策略拒绝
+的上下文返回 `EACCES(13)`，对策略里不存在的上下文返回 `EINVAL(22)`。
+Duck 正是用这个差别判定 `magisk`/`magisk_file`/`lsposed_file` 的存在
+（`CONTEXT_RECOGNIZED`）。hook 1–3 让这些名字一律表现为"策略里根本没有"，
+与 KernelSU 的内核隐藏思路一致。
 
-`jni/avc.cpp` is a ZygiskNext-free port of [ZN-AuditPatch](https://github.com/aviraxp/ZN-AuditPatch):
-instead of injecting `logd` it drops leaking AVC records from
-`__android_log_*` and from `read()` buffers, so `logcat -b events` no longer
-shows the hidden contexts. It never fabricates `u:r:priv_app:s0:c512,c768`,
-which Duck-Detector treats as a forgery marker.
+隐藏上下文匹配表（子串，覆盖 domain / file type / property type）：
 
-## Build
+```
+magisk  lsposed  zygisk  kernelsu  ksu  apatch  adbroot  xposed
+droidspaces  msd_app  msd_daemon  auditpatch  dirtysep  dsb_
+```
 
-Two supported paths:
+### 脏边应答改写
+
+hook 4 在 **entry** 里用查询字符串（`scon tcon tclass`）判断，不需要 SID
+查找、不遍历策略，也完全不引用 SELinux 内部结构；命中后记下 `buf` 指针，
+在返回处把
+
+```
+allowed  decided  auditallow  auditdeny  seqno  flags
+```
+
+重写成 `0 ffffffff 0 <auditdeny> <seqno> <flags>`，返回长度同步改成新长度
+（`selinux_transaction_write` 用它来设置 transaction 长度）。覆盖的脏边：
+
+| scon | tcon | 检测项 |
+|---|---|---|
+| `system_server` | `system_server` | execmem |
+| `system_server` | `apk_data_file` | LSPosed 注入 |
+| `zygote` | `adb_data_file` | ZygiskNext |
+| `kernel` | `adb_data_file` | KernelSU |
+| `kernel` | `tmpfs` | Magisk fifo |
+| `rootfs` | `tmpfs` | Magisk associate |
+| `dex2oat` | `dex2oat_exec` | Xposed |
+| `fsck_untrusted` | `fsck_untrusted` | Dirty 策略 |
+| `shell` | `su` | root 提权痕迹 |
+| `adbd` | `adbroot` | adb root |
+| `untrusted_app` | `magisk_file` | Magisk |
+| `untrusted_app` | `lsposed_file` | LSPosed |
+
+对照报告，控制项保持 ALLOWED（`app_zygote→app_zygote setcurrent`、
+`app_zygote→kernel check_context`、`app_zygote→isolated_app dyntransition`）
+和已经 DENIED 的项（`fsck_untrusted sys_admin`、`shell→su transition`、
+`kernel→adb_data_file read`）都不在改写列表里。
+
+### 挂载表
+
+hook 5/6 在 entry 记录 `seq_file->count`，返回后若新增片段命中
+`magisk`、`/adb/modules`、`/debug_ramdisk`、`/data/adb`、`/data/local/tmp`、
+`lsposed`、`zygisk`、`kernelsu`、`apatch`、`/sbin` 之一，就把
+`m->count` 回退到调用前的值——整行不出现，而不是在用户态做字符串替换。
+
+## 模块保护与加载
+
+设备内核是 GKI：`CONFIG_MODULE_SIG_PROTECT=y`（但无 `MODULE_SIG_FORCE`），
+因此未签名模块可以加载，但被当作 vendor 模块，只能使用
+`include/config/abi_gki_kmi_symbols`（vendor KMI 列表并集）里的符号。
+本模块只需要 `register_kretprobe`、`unregister_kretprobe`、`_printk`、
+`__stack_chk_fail` 和 `module_layout`，这些都在该并集里
+（`register_kretprobe` 来自 QCOM 列表，`_printk`/`__stack_chk_fail` 来自
+MTK 列表，`module_layout` 来自基线列）。
+
+`CONFIG_MODVERSIONS=y` 的 CRC 校验靠 `tools/fixup-versions.py` 处理：
+构建时没有 `Module.symvers`，`__versions` 节为空但**存在**。内核
+`check_version()` 在节存在、无匹配条目时只打印一次警告并放行
+（`versindex == 0` 才会走 `try_to_force_load`，那才是必须 `--force` 的
+情况）；同时 `same_magic()` 因为 `__versions` 存在而跳过版本号前缀，
+所以 CI 里从 codeload 下载的无 `.git` 源码树（vermagic 没有 `-g` 哈希）
+也能加载。
+
+## 构建
+
+### GitHub Actions
+
+`.github/workflows/build.yml` 安装 clang/lld/llvm 与内核构建依赖，缓存
+`.kout`，调用 `tools/build.sh`，产出 `dirtysepbypass-module` artifact，
+打 tag 时自动附到 release。
+
+### 本地
 
 ```sh
-# GitHub Actions: .github/workflows/build.yml builds all ABIs and uploads
-# dirtysepbypass-module (zip) as an artifact, and attaches it to tagged releases.
+sudo apt-get install -y clang lld llvm make bc flex bison libelf-dev \
+                        libssl-dev dwarves python3 curl
 
-# Local build (Android NDK r26+ and python3):
-export ANDROID_NDK_HOME=/path/to/ndk
+# 复用已有内核源码/输出目录（推荐）
+KERNEL_SRC=/path/to/android_kernel_oneplus_mt6991 KERNEL_OUT=/path/to/out \
+  ./tools/build.sh
+# 或不指定，脚本按固定 SHA 自动下载到 .kernel / .kout
 ./tools/build.sh
-# -> dist/dirtysepbypass-v4.2.1.zip
+# -> dist/dirtysepbypass-v5.0.0.zip
 ```
 
-`tools/build.sh` runs `ndk-build` for arm64-v8a, armeabi-v7a, x86 and x86_64,
-copies each `libdirtysepbypass.so` to `module/zygisk/<abi>.so`, then packages
-the flashable zip.
+`tools/build.sh` 执行 `gki_defconfig` → `modules_prepare` →
+`M=kmod modules`，用 `fixup-versions.py` 清空 `__versions`，把
+`dsb_kmod.ko` 放进 `module/kmod/`，再用 Python 打包 zip（`customize.sh`/
+`post-fs-data.sh`/`update-binary` 置 0755）。
 
-<details>
-<summary>Manual single-ABI build (Termux)</summary>
+## 安装
 
-```sh
-cd jni
-aarch64-linux-android-clang++ \
-  -std=c++17 -fno-exceptions -fno-rtti \
-  -fPIC -shared -O2 \
-  -fvisibility=hidden -fvisibility-inlines-hidden \
-  -fdata-sections -ffunction-sections \
-  -nostdlib++ -Wall -Wextra \
-  -Wl,--hash-style=both -Wl,--gc-sections \
-  -Wl,-soname,libdirtysepbypass.so \
-  -o ../module/zygisk/arm64-v8a.so \
-  module.cpp stealth.cpp avc.cpp -llog
-patchelf --remove-rpath ../module/zygisk/arm64-v8a.so
-```
-
-Add `-DDEBUG` for verbose logging.
-
-</details>
-
-## Install
-
-Via Magisk app: **Modules > Install from storage > select the zip > Reboot.**
-Or from a root shell:
+Magisk 应用：**模块 → 从本地安装 → 选择 zip → 重启**。或：
 
 ```sh
 su -c "magisk --install-module /sdcard/dirtysepbypass.zip"
 su -c reboot
 ```
 
-## Verify
+`post-fs-data.sh` 在 zygote 启动前 `insmod`，因此之后启动的所有应用都被
+覆盖。`sepolicy.rule` 只为 magisk 域补上 `capability:sys_module` 和
+`system:module_load`（`init_module` 会对调用者自身 SID 检查这两项）。
 
-1. Open DirtySepolicy. A successful bypass shows:
+## 验证
 
-   ```
-   OK: no dirty sepolicy found
-   INFO: sequence=0 policyload=0
-   ```
+```sh
+# 1. 模块是否加载
+cat /data/adb/modules/dirtysepbypass/load.log
+dmesg | grep dsb_kmod
+# 期望：hooked <6 个函数> / loaded, 6/6 hooks active
 
-   Kernel < 6.10: `sequence=0 policyload=0`; kernel ≥ 6.10:
-   `sequence=4 policyload=1`.
+# 2. 以普通应用身份看不到 root 挂载（shell 看不到属正常）
+su -c "su 2000 -c 'cat /proc/self/mountinfo'" | grep -Ei 'magisk|/adb/modules|/debug_ramdisk'
 
-2. Run the audit tool (raw kernel state vs. hook tables):
+# 3. 复跑 Duck-Detector，SELinux/Mount 两项应不再报 DANGER
+```
 
-   ```sh
-   su -c "python3 tools/audit.py"
-   ```
+卸载：Magisk 里移除模块并重启（内核模块随重启消失）。
 
-3. Debug builds log under the `selinuxfs` tag:
+## 参考实现
 
-   ```sh
-   su -c "logcat -d -s selinuxfs"
-   ```
+- [Admirepowered/selinux_hook](https://github.com/Admirepowered/selinux_hook)
+  —— 在 `security_context_to_sid` 上做 kprobe 的思路
+- [tiann/KernelSU](https://github.com/tiann/KernelSU) —— 内核侧 SELinux 隐藏
+- [maxsteeel/nomount](https://github.com/maxsteeel/nomount) —— mount 表隐藏的 LKM 实现
 
-## Extending the bypass
+## 限制
 
-If `audit.py` reports a `LEAK`:
+- **只对普通应用（uid ≥ 10000）隐藏。** root、shell、system 与系统服务看到
+  的仍是真实状态，这是刻意设计；如果检测器以 shell/root 身份运行，不在
+  覆盖范围内。
+- **仅 arm64 + 匹配的 GKI KMI。** 需要内核允许 kretprobe（本机
+  `CONFIG_KPROBES=y`、`CONFIG_KALLSYMS_ALL=y`）并允许加载未签名模块。
+  `security_context_to_sid`、`selinux_setprocattr`、`sel_write_*`、
+  `show_mountinfo`、`show_vfsmnt` 都必须存在于 kallsyms（本机满足）。
+- **子串黑名单。** 新框架的新类型名需要手动加进 `hidden_ctx_parts[]`；新
+  的脏边需要加进 `dirty_pairs[]`。
+- **挂载行整行丢弃。** 只处理 `/proc/<pid>/mountinfo` 和 `/proc/<pid>/mounts`；
+  `statfs`/`getmntent` 以外的其他来源（例如 `/proc/self/mountstats`）未处理。
+- **内核侧可检测性。** kprobe 对 root 可见（`/sys/kernel/debug/kprobes/list`、
+  `dmesg`），普通应用不可见；模块本身也无法隐藏自己的 `insmod` 痕迹。
+- **Memory 项。** 报告中的匿名可执行映射是 ART JIT 的正常行为，本模块
+  不做处理；`maps` 里的 `zygisk/*.so` 已随 Zygisk 方案一起移除。
+- **Dangerous Apps（Scene/HMA）。** 与 SELinux 隐藏无关，本模块不涉及。
 
-- **New context name:** add the substring to `jni/rules.h` (`kHiddenTokens`)
-  and `HOOK_BLOCKLIST` in `tools/audit.py`.
-- **New indirect stock-context probe:** add the tuple to `kHiddenExact[]` in
-  `jni/module.cpp` and `HOOK_EXACT_PROBES` in `tools/audit.py`.
-- **New path / binary token:** extend `restricted_path()` / `kBinaryTokens`
-  in `jni/rules.h`.
-
-Rebuild, reflash, reboot, re-audit.
-
-## Limitations
-
-- **Substring blocklist.** New frameworks with novel type names need manual
-  additions.
-- **Exact-match table.** New indirect probes using stock contexts need manual
-  additions.
-- **No logd injection.** A plain Magisk Zygisk module cannot inject `logd`
-  (this is what ZygiskNext provides to ZN-AuditPatch). Records are dropped
-  inside hooked processes and when read back through `read()`; AVC records
-  produced by entirely unhooked processes are not rewritten. `logcat` itself
-  launched by the detector inherits the hook, so its child output is filtered.
-- **Binary policy scrub is chunk-local.** A framework string split across two
-  reads cannot be erased; a detector that reads the whole blob in one
-  `read()` is covered.
-- **Status values.** `sequence`/`policyload` patches assume the standard
-  clean-boot baselines listed above.
-- **memfd artifact.** Scrubbed files are served from `memfd:jit-cache`
-  (a name ART also uses); the fd target remains visible as an anonymous
-  inode by design.
-- **Cross-process probe (profileable apps only).** For ordinary apps, same-uid
-  cross-process reads already fail on stock Android (non-dumpable), so there is
-  nothing to observe. For `PROFILE_FROM_SHELL` apps the module clears dumpable
-  where stock would have allowed the read; a detector that profiles its own
-  process and expects that succeeded read can treat `EACCES` as a signal.
-  Debuggable apps keep dumpable=1.
-- **Raw syscalls and memory scans.** Code that issues `syscall()` inline
-  instead of through libc's PLT, or scans its own heap/ELF for module strings,
-  bypasses these userspace hooks (the `syscall` wrapper is hooked, inline
-  assembly is not).
-- **Path heuristic.** Framework names are matched in the final path component
-  or `[annotation]`; a mapping whose basename is deliberately innocuous is not
-  caught.
-
-## Compatibility
-
-| Requirement | Notes |
-|---|---|
-| arm64-v8a, armeabi-v7a, x86, x86_64 | Built for all four ABIs. |
-| Android >= 10 | App Zygote detection surface was added in Android 10. |
-| Magisk >= 24 + Zygisk | Requires Zygisk API v5. KitsuneMask also works. |
-
-## License
+## 许可
 
 Apache 2.0

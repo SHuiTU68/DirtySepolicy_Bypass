@@ -1,0 +1,5 @@
+# Rules applied by Magisk before post-fs-data.sh runs.
+# init_module() checks capability:sys_module and system:module_load against
+# the caller's own SID (magisk), so the module can be loaded from there.
+allow magisk self:capability sys_module;
+allow magisk magisk:system module_load;
