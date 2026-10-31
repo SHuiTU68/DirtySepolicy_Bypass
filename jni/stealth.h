@@ -55,10 +55,12 @@ void set_app_mode(bool app);
 // target is dumpable.  Zygote normally leaves app processes non-dumpable
 // already (setresuid with suid_dumpable=0, plus SpecializeCommon's explicit
 // clear), so this is a no-op for them and only closes the PROFILE_FROM_SHELL
-// case.  It must be called from postAppSpecialize, after specialization; the
-// resulting root-owned /proc inodes and PR_GET_DUMPABLE answer are spoofed by
-// the stat/prctl hooks only when the flag was really changed.
-void guard_process();
+// case.  It must be called from postAppSpecialize, after specialization.
+// Returns true only when the process really was user-dumpable and got cleared;
+// the stat/statx/prctl spoof hooks are then installed, so ordinary apps never
+// carry them.  Those hooks mask the root-owned /proc inodes and make
+// PR_GET_DUMPABLE answer 1 again.
+bool guard_process();
 
 // Returns an anonymous memfd holding a scrubbed copy of `path`, or -1 when
 // the path is not one of the guarded files / cannot be opened.

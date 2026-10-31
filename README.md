@@ -131,7 +131,9 @@ every app and system_server process.
   and both `prctl(PR_GET_DUMPABLE)` and `syscall(__NR_prctl, ...)` answer `1`.
   Root/CAP_SYS_PTRACE readers (debuggerd, tombstones, `dumpsys`) still work.
   Debuggable apps (`runtime_flags & DEBUG_ENABLE_DEBUGGER`) are skipped so
-  native/JDWP debugging keeps working.
+  native/JDWP debugging keeps working. The spoof hooks (`prctl`, `syscall`,
+  stat family, `statx`) are registered lazily and only in that process, so
+  ordinary apps and `system_server` keep the plain hook set.
 
 Scrubbing is enabled **only for ordinary, non-root app processes** (uid ≥
 10000 and without `PROCESS_GRANTED_ROOT`). Root-granted apps and

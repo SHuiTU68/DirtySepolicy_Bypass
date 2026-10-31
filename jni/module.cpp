@@ -9,12 +9,13 @@
 //    policy reloads (sequence/policyload counters) and blocking mmap of it.
 // 4. PLT-hooking libselinux APIs as defense-in-depth against detectors that
 //    still use the userspace library.
-// 5. Re-clearing PR_SET_DUMPABLE in postAppSpecialize for ordinary apps so
-//    same-uid cross-process readers (forked cat, process_vm_readv, ptrace)
-//    cannot see maps/mem.  Zygote already leaves normal apps non-dumpable;
-//    only profileable ones (PROFILE_FROM_SHELL) need the extra clear, and the
-//    resulting /proc ownership and PR_GET_DUMPABLE answers are masked only
-//    when the flag was actually changed.
+// 5. Re-clearing PR_SET_DUMPABLE in postAppSpecialize so same-uid
+//    cross-process readers (forked cat, process_vm_readv, ptrace) cannot see
+//    maps/mem.  Zygote already leaves normal apps non-dumpable; only
+//    profileable ones (PROFILE_FROM_SHELL) need the extra clear.  The
+//    stat/statx/prctl spoof hooks are registered lazily and only in the
+//    process that was actually cleared, never in ordinary apps or
+//    system_server.
 // 6. Handing out scrubbed copies of /proc/{self,thread-self,<pid>}/{
 //    maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,environ},
 //    fd link targets, linker solists and environment variables so a normal app
@@ -730,7 +731,7 @@ static void *my_mmap64(void *addr, size_t len, int prot, int flags, int fd,
 
 // ---- map walking --------------------------------------------------------
 
-static int register_against_all_libs(zygisk::Api *api) {
+static int register_against_all_libs(zygisk::Api *api, bool guard) {
     FILE *fp = fopen("/proc/self/maps", "re");
     if (!fp) {
         LOGW("fopen(/proc/self/maps) failed: %s", strerror(errno));
@@ -754,6 +755,26 @@ static int register_against_all_libs(zygisk::Api *api) {
             api->pltHookRegister(st.st_dev, st.st_ino, sym, fn, old);
         };
 
+        if (guard) {
+            // Installed lazily, only in the rare process where guard_process()
+            // actually cleared a user-dumpable flag.  Registering these for
+            // every app (and system_server) is too invasive: the syscall/stat
+            // wrappers sit on very hot paths and any mistake there takes the
+            // whole Zygisk provider down with it.
+            hook("prctl",     (void *)stealth::my_prctl,     (void **)&stealth::orig_prctl);
+            hook("syscall",   (void *)stealth::my_syscall,   (void **)&stealth::orig_syscall);
+            hook("stat",      (void *)stealth::my_stat,      (void **)&stealth::orig_stat);
+            hook("lstat",     (void *)stealth::my_lstat,     (void **)&stealth::orig_lstat);
+            hook("fstat",     (void *)stealth::my_fstat,     (void **)&stealth::orig_fstat);
+            hook("fstatat",   (void *)stealth::my_fstatat,   (void **)&stealth::orig_fstatat);
+            hook("statx",     (void *)stealth::my_statx,     (void **)&stealth::orig_statx);
+#ifdef DSB_HAVE_STAT64
+            hook("stat64",    (void *)stealth::my_stat64,    (void **)&stealth::orig_stat64);
+            hook("lstat64",   (void *)stealth::my_lstat64,   (void **)&stealth::orig_lstat64);
+            hook("fstat64",   (void *)stealth::my_fstat64,   (void **)&stealth::orig_fstat64);
+            hook("fstatat64", (void *)stealth::my_fstatat64, (void **)&stealth::orig_fstatat64);
+#endif
+        } else {
         hook("open",      (void *)my_open,           (void **)&orig_open);
         hook("open64",    (void *)my_open64,         (void **)&orig_open64);
         hook("openat",    (void *)my_openat,         (void **)&orig_openat);
@@ -774,22 +795,6 @@ static int register_against_all_libs(zygisk::Api *api) {
         hook("dl_iterate_phdr", (void *)stealth::my_dl_iterate_phdr,
              (void **)&stealth::orig_dl_iterate_phdr);
 
-        // Cross-process /proc readers (forked cat, process_vm_readv, ptrace)
-        // and the tells that dumpable=0 leaves behind.
-        hook("prctl",     (void *)stealth::my_prctl,     (void **)&stealth::orig_prctl);
-        hook("syscall",   (void *)stealth::my_syscall,   (void **)&stealth::orig_syscall);
-        hook("stat",      (void *)stealth::my_stat,      (void **)&stealth::orig_stat);
-        hook("lstat",     (void *)stealth::my_lstat,     (void **)&stealth::orig_lstat);
-        hook("fstat",     (void *)stealth::my_fstat,     (void **)&stealth::orig_fstat);
-        hook("fstatat",   (void *)stealth::my_fstatat,   (void **)&stealth::orig_fstatat);
-        hook("statx",     (void *)stealth::my_statx,     (void **)&stealth::orig_statx);
-#ifdef DSB_HAVE_STAT64
-        hook("stat64",    (void *)stealth::my_stat64,    (void **)&stealth::orig_stat64);
-        hook("lstat64",   (void *)stealth::my_lstat64,   (void **)&stealth::orig_lstat64);
-        hook("fstat64",   (void *)stealth::my_fstat64,   (void **)&stealth::orig_fstat64);
-        hook("fstatat64", (void *)stealth::my_fstatat64, (void **)&stealth::orig_fstatat64);
-#endif
-
         hook("__android_log_write",     (void *)avc::my_log_write,     (void **)&avc::orig_log_write);
         hook("__android_log_buf_write", (void *)avc::my_log_buf_write, (void **)&avc::orig_log_buf_write);
         hook("__android_log_print",     (void *)avc::my_log_print,     (void **)&avc::orig_log_print);
@@ -804,6 +809,7 @@ static int register_against_all_libs(zygisk::Api *api) {
         hook("selinux_check_access",
              (void *)my_selinux_check_access,
              (void **)&orig_selinux_check_access);
+        }
         ++n;
     }
     fclose(fp);
@@ -834,7 +840,7 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         // Must run after SpecializeCommon: its setresuid / PR_SET_DUMPABLE
         // calls would overwrite a flag cleared in preAppSpecialize.
-        if (proc_guard) stealth::guard_process();
+        if (proc_guard && stealth::guard_process()) install_guard_hooks();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
@@ -850,7 +856,7 @@ private:
         stealth::set_app_mode(app_process);
         detect_kernel_version();
         resolve_hidden_bits();
-        int n = register_against_all_libs(api);
+        int n = register_against_all_libs(api, false);
         if (n == 0) {
             LOGW("[%s] no .so libs found to hook", who);
             return;
@@ -860,6 +866,20 @@ private:
                  who, n);
         } else {
             LOGI("[%s] hooks committed across %d libs", who, n);
+        }
+    }
+
+    // Registers the dumpable-spoof hooks only in the process that actually
+    // needed guard_process().  Every other app and system_server keeps the
+    // plain hook set, so a bug here cannot take the Zygisk provider down for
+    // everyone.
+    void install_guard_hooks() {
+        int n = register_against_all_libs(api, true);
+        if (n == 0) return;
+        if (!api->pltHookCommit()) {
+            LOGW("guard hooks commit failed after %d libs", n);
+        } else {
+            LOGI("guard hooks committed across %d libs", n);
         }
     }
 };

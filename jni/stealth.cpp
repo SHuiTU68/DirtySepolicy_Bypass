@@ -629,13 +629,14 @@ static long raw_prctl(long option, long a2, long a3, long a4, long a5) {
 #endif
 }
 
-void guard_process() {
+bool guard_process() {
     long prev = raw_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
     // SUID_DUMP_DISABLE (0) and SUID_DUMP_ROOT (2) already make
     // task_still_dumpable() fail, so only the user-dumpable state needs action.
-    if (prev != 1) return;
+    if (prev != 1) return false;
     raw_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
     g_dumpable_spoof = true;
+    return true;
 }
 
 static bool raw_readlink_target(int fd, char *out, size_t cap) {

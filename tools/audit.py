@@ -408,7 +408,9 @@ def main():
     print("  getenv/secure_getenv         -> MAGISK*/ZYGISK*/KSU*/... return NULL")
     print("  path match                   -> /data/adb dirs, or module names in")
     print("                                  the final path component / [annotation]")
-    print("  prctl/syscall PR_GET_DUMPABLE -> stock value (1 only after our clear)")
+    print("  ⚠ prctl/syscall/stat/statx spoof hooks are installed lazily and")
+    print("    only in a process whose dumpable flag was actually cleared;")
+    print("    ordinary apps and system_server never carry them")
     print("  stat/statx family (own /proc/<pid>) -> st_uid/st_gid stx_uid/stx_gid")
     print("                                  kept stock (profileable only)")
 
