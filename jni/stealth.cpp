@@ -16,8 +16,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef PR_GET_DUMPABLE
+#define PR_GET_DUMPABLE 3
+#endif
+#ifndef PR_SET_DUMPABLE
+#define PR_SET_DUMPABLE 4
+#endif
 
 #ifndef __NR_memfd_create
 #if defined(__aarch64__)
@@ -44,6 +53,18 @@ ssize_t  (*orig_readlinkat)(int, const char *, char *, size_t) = nullptr;
 char    *(*orig_getenv)(const char *) = nullptr;
 char    *(*orig_secure_getenv)(const char *) = nullptr;
 int      (*orig_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
+int      (*orig_prctl)(int, ...) = nullptr;
+long     (*orig_syscall)(long, ...) = nullptr;
+int      (*orig_stat)(const char *, struct stat *) = nullptr;
+int      (*orig_lstat)(const char *, struct stat *) = nullptr;
+int      (*orig_fstat)(int, struct stat *) = nullptr;
+int      (*orig_fstatat)(int, const char *, struct stat *, int) = nullptr;
+#ifdef DSB_HAVE_STAT64
+int      (*orig_stat64)(const char *, struct stat64 *) = nullptr;
+int      (*orig_lstat64)(const char *, struct stat64 *) = nullptr;
+int      (*orig_fstat64)(int, struct stat64 *) = nullptr;
+int      (*orig_fstatat64)(int, const char *, struct stat64 *, int) = nullptr;
+#endif
 
 // External linkage on purpose: read by open_virtual(), written by the Zygisk
 // specialization callbacks.
@@ -565,5 +586,202 @@ int my_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *d
     PhdrCtx ctx = {cb, data};
     return orig_dl_iterate_phdr(phdr_filter, &ctx);
 }
+
+// ---- same-uid cross-process /proc reads ----------------------------------
+//
+// Hooks only cover code inside this process.  A detector can fork a helper
+// ("cat /proc/<our-pid>/maps", process_vm_readv, PTRACE_ATTACH) that runs
+// outside our reach, and the kernel will happily serve the untouched file
+// because both processes share the app uid.  Linux gates those accesses with
+// ptrace_may_access(), which requires the target to be dumpable
+// (SUID_DUMP_USER == 1).
+//
+// AOSP's zygote normally leaves app processes non-dumpable already:
+// setresuid from uid 0 resets the flag to /proc/sys/fs/suid_dumpable (0), and
+// SpecializeCommon forces 0 when suid_dumpable is 2.  Blocking is therefore
+// stock behaviour for ordinary apps and guard_process() does nothing for them.
+// The flag is only raised again for PROFILE_FROM_SHELL (profileable) apps;
+// clearing it for those is what closes the cross-process hole.
+//
+// This must run in postAppSpecialize: a preAppSpecialize hook would be
+// overwritten by SpecializeCommon's own setresuid / PR_SET_DUMPABLE calls.
+//
+// The side effects are masked only when we actually changed the flag
+// (prev == SUID_DUMP_USER), because otherwise they would deviate from stock:
+//   * /proc/<pid> and everything below it become root-owned -> rewrite
+//     st_uid/st_gid in the stat family;
+//   * prctl(PR_GET_DUMPABLE) would answer 0            -> answer 1;
+//   * the same check through syscall(__NR_prctl, ...)  -> filtered too.
+// When prev was 0 the process already matched stock (root-owned proc inodes,
+// PR_GET_DUMPABLE == 0), so every hook stays transparent and only forwards.
+
+static bool g_dumpable_spoof = false;
+
+static long raw_prctl(long option, long a2, long a3, long a4, long a5) {
+#ifdef __NR_prctl
+    if (orig_syscall) return orig_syscall(__NR_prctl, option, a2, a3, a4, a5);
+    return ::syscall(__NR_prctl, option, a2, a3, a4, a5);
+#else
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    return prctl(option, 0);
+#endif
+}
+
+void guard_process() {
+    long prev = raw_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+    // SUID_DUMP_DISABLE (0) and SUID_DUMP_ROOT (2) already make
+    // task_still_dumpable() fail, so only the user-dumpable state needs action.
+    if (prev != 1) return;
+    raw_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    g_dumpable_spoof = true;
+}
+
+static bool raw_readlink_target(int fd, char *out, size_t cap) {
+    if (fd < 0 || !out || cap == 0) return false;
+    char link[64];
+    int n = snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof link) return false;
+#ifdef __NR_readlinkat
+    long r = syscall(__NR_readlinkat, AT_FDCWD, link, out, cap - 1);
+#else
+    long r = syscall(__NR_readlink, link, out, cap - 1);
+#endif
+    if (r <= 0) return false;
+    out[r] = '\0';
+    return true;
+}
+
+// Any path under this process's own /proc/<pid>, including /proc/self and
+// /proc/thread-self aliases.  Only directory ownership changes when the
+// process is non-dumpable, but every procfs inode for that pid is affected,
+// so the whole subtree is rewritten.
+static bool proc_path_self(const char *path) {
+    if (!path || strncmp(path, "/proc/", 6) != 0) return false;
+    const char *rest = path + 6;
+    if (strncmp(rest, "self", 4) == 0 && (rest[4] == '\0' || rest[4] == '/'))
+        return true;
+    if (strncmp(rest, "thread-self", 11) == 0 &&
+        (rest[11] == '\0' || rest[11] == '/'))
+        return true;
+
+    const char *q = rest;
+    const char *digits = q;
+    long pid = 0;
+    while (is_digit(*q)) { pid = pid * 10 + (*q - '0'); ++q; }
+    if (q == digits || pid != static_cast<long>(getpid())) return false;
+    return *q == '\0' || *q == '/';
+}
+
+static bool fd_is_self_proc(int fd) {
+    char target[256];
+    return raw_readlink_target(fd, target, sizeof target) &&
+           proc_path_self(target);
+}
+
+static bool at_is_self_proc(int dirfd, const char *path) {
+    if (!path) return false;
+    if (path[0] == '/') return proc_path_self(path);
+    if (dirfd < 0) return false;
+    char target[256];
+    if (!raw_readlink_target(dirfd, target, sizeof target)) return false;
+    return proc_path_self(target);
+}
+
+template <typename StatT>
+static void fix_owner(StatT *st) {
+    if (!st) return;
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+}
+
+int my_prctl(int option, ...) {
+    if (g_app_mode && g_dumpable_spoof && option == PR_GET_DUMPABLE) return 1;
+
+    va_list ap;
+    va_start(ap, option);
+    unsigned long a1 = va_arg(ap, unsigned long);
+    unsigned long a2 = va_arg(ap, unsigned long);
+    unsigned long a3 = va_arg(ap, unsigned long);
+    unsigned long a4 = va_arg(ap, unsigned long);
+    va_end(ap);
+    if (!orig_prctl) { errno = ENOSYS; return -1; }
+    return orig_prctl(option, a1, a2, a3, a4);
+}
+
+long my_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    unsigned long a1 = va_arg(ap, unsigned long);
+    unsigned long a2 = va_arg(ap, unsigned long);
+    unsigned long a3 = va_arg(ap, unsigned long);
+    unsigned long a4 = va_arg(ap, unsigned long);
+    unsigned long a5 = va_arg(ap, unsigned long);
+    unsigned long a6 = va_arg(ap, unsigned long);
+    va_end(ap);
+
+    if (g_app_mode && g_dumpable_spoof && number == __NR_prctl &&
+        static_cast<int>(a1) == PR_GET_DUMPABLE)
+        return 1;
+    if (!orig_syscall) { errno = ENOSYS; return -1; }
+    return orig_syscall(number, a1, a2, a3, a4, a5, a6);
+}
+
+int my_stat(const char *path, struct stat *st) {
+    if (!orig_stat) { errno = ENOSYS; return -1; }
+    int r = orig_stat(path, st);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && proc_path_self(path)) fix_owner(st);
+    return r;
+}
+
+int my_lstat(const char *path, struct stat *st) {
+    if (!orig_lstat) { errno = ENOSYS; return -1; }
+    int r = orig_lstat(path, st);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && proc_path_self(path)) fix_owner(st);
+    return r;
+}
+
+int my_fstat(int fd, struct stat *st) {
+    if (!orig_fstat) { errno = ENOSYS; return -1; }
+    int r = orig_fstat(fd, st);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && fd_is_self_proc(fd)) fix_owner(st);
+    return r;
+}
+
+int my_fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+    if (!orig_fstatat) { errno = ENOSYS; return -1; }
+    int r = orig_fstatat(dirfd, path, st, flags);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && at_is_self_proc(dirfd, path)) fix_owner(st);
+    return r;
+}
+
+#ifdef DSB_HAVE_STAT64
+int my_stat64(const char *path, struct stat64 *st) {
+    if (!orig_stat64) { errno = ENOSYS; return -1; }
+    int r = orig_stat64(path, st);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && proc_path_self(path)) fix_owner(st);
+    return r;
+}
+
+int my_lstat64(const char *path, struct stat64 *st) {
+    if (!orig_lstat64) { errno = ENOSYS; return -1; }
+    int r = orig_lstat64(path, st);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && proc_path_self(path)) fix_owner(st);
+    return r;
+}
+
+int my_fstat64(int fd, struct stat64 *st) {
+    if (!orig_fstat64) { errno = ENOSYS; return -1; }
+    int r = orig_fstat64(fd, st);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && fd_is_self_proc(fd)) fix_owner(st);
+    return r;
+}
+
+int my_fstatat64(int dirfd, const char *path, struct stat64 *st, int flags) {
+    if (!orig_fstatat64) { errno = ENOSYS; return -1; }
+    int r = orig_fstatat64(dirfd, path, st, flags);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && at_is_self_proc(dirfd, path)) fix_owner(st);
+    return r;
+}
+#endif
 
 }  // namespace stealth

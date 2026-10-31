@@ -53,6 +53,8 @@ Duck-Detector adds:
 | `open`/`open64`/`openat`/`openat64`/`fopen`/`fopen64` | `/proc/{self,thread-self,<own-pid>}/{maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,mountstats,environ}`, `task/<tid>/*` | Serve a scrubbed anonymous memfd copy |
 | `readlink`/`readlinkat` | `/proc/self/fd/*` | `ENOENT` for module/deleted `.so` targets |
 | `dl_iterate_phdr` | linker solist | Hide module entries |
+| `prctl` / `syscall(__NR_prctl)` | `PR_GET_DUMPABLE` | Report the stock value after the profileable clear (answer `1` only when we changed it) |
+| `stat`/`lstat`/`fstat`/`fstatat` (+64-bit variants) | own `/proc/<pid>` subtree | Rewrite `st_uid`/`st_gid` to the app uid (profileable case only) |
 | `getenv`/`secure_getenv` | `TMP_PATH`, `MAGISK*`, `ZYGISK*`, … | Return `NULL` |
 | `__android_log_write/buf_write/print/vprint` | AVC audit records | Drop leaking lines at the source |
 | `read`/`pread64` (≤8 KiB) | logcat-style streams | Drop leaking AVC lines that come back |
@@ -111,6 +113,25 @@ every app and system_server process.
 - Framework names are matched only in the final path component or a
   `[bracket]` mapping annotation, so an app whose own package path contains
   `magisk`/`lsposed` is not scrubbed out of its own maps.
+- **Cross-process readers are blocked at the kernel gate.** PLT hooks only
+  cover this process, so a detector could fork a helper
+  (`Runtime.exec("cat /proc/<our-pid>/maps")`) or use `process_vm_readv` /
+  `PTRACE_ATTACH` from the same uid. `ptrace_may_access()` refuses those unless
+  the target is dumpable. AOSP's zygote already makes ordinary apps
+  non-dumpable: `SpecializeCommon` runs `setresuid()`, which resets the flag to
+  `/proc/sys/fs/suid_dumpable` (0), and forces 0 explicitly when that sysctl is
+  2. That is stock behaviour, so for a normal app the module changes nothing —
+  the root-owned `/proc/<pid>` inodes and `PR_GET_DUMPABLE == 0` stay exactly
+  as stock. The only gap is `PROFILE_FROM_SHELL` (profileable) apps, where
+  zygote raises `PR_SET_DUMPABLE` back to 1; `guard_process()` runs in
+  `postAppSpecialize` (a `preAppSpecialize` clear would be overwritten by
+  specialization) and clears it again. Only when the flag really changed from
+  the user-dumpable state are the side effects masked: the stat family rewrites
+  the now root-owned `/proc/<pid>` inodes back to the app uid, and both
+  `prctl(PR_GET_DUMPABLE)` and `syscall(__NR_prctl, ...)` answer `1`.
+  Root/CAP_SYS_PTRACE readers (debuggerd, tombstones, `dumpsys`) still work.
+  Debuggable apps (`runtime_flags & DEBUG_ENABLE_DEBUGGER`) are skipped so
+  native/JDWP debugging keeps working.
 
 Scrubbing is enabled **only for ordinary, non-root app processes** (uid ≥
 10000 and without `PROCESS_GRANTED_ROOT`). Root-granted apps and
@@ -134,7 +155,7 @@ Two supported paths:
 # Local build (Android NDK r26+ and python3):
 export ANDROID_NDK_HOME=/path/to/ndk
 ./tools/build.sh
-# -> dist/dirtysepbypass-v4.1.0.zip
+# -> dist/dirtysepbypass-v4.2.0.zip
 ```
 
 `tools/build.sh` runs `ndk-build` for arm64-v8a, armeabi-v7a, x86 and x86_64,
@@ -229,13 +250,17 @@ Rebuild, reflash, reboot, re-audit.
 - **memfd artifact.** Scrubbed files are served from `memfd:jit-cache`
   (a name ART also uses); the fd target remains visible as an anonymous
   inode by design.
-- **Cross-process `/proc` reads.** Hooks live inside the app process. A
-  detector that forks a helper (`Runtime.exec("cat /proc/<app-pid>/maps")`)
-  reads the untouched file from a process we were never injected into. Only a
-  kernel-side solution (KernelSU's `kernel_umount`/LSM work) closes this.
+- **Cross-process probe (profileable apps only).** For ordinary apps, same-uid
+  cross-process reads already fail on stock Android (non-dumpable), so there is
+  nothing to observe. For `PROFILE_FROM_SHELL` apps the module clears dumpable
+  where stock would have allowed the read; a detector that profiles its own
+  process and expects that succeeded read can treat `EACCES` as a signal.
+  `statx` is not hooked, so one on a profileable app sees the root-owned
+  `/proc/<pid>` inode instead of the app uid. Debuggable apps keep dumpable=1.
 - **Raw syscalls and memory scans.** Code that issues `syscall()` inline
   instead of through libc's PLT, or scans its own heap/ELF for module strings,
-  bypasses these userspace hooks.
+  bypasses these userspace hooks (the `syscall` wrapper is hooked, inline
+  assembly is not).
 - **Path heuristic.** Framework names are matched in the final path component
   or `[annotation]`; a mapping whose basename is deliberately innocuous is not
   caught.

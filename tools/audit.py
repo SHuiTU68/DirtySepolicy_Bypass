@@ -408,6 +408,22 @@ def main():
     print("  getenv/secure_getenv         -> MAGISK*/ZYGISK*/KSU*/... return NULL")
     print("  path match                   -> /data/adb dirs, or module names in")
     print("                                  the final path component / [annotation]")
+    print("  prctl/syscall PR_GET_DUMPABLE -> stock value (1 only after our clear)")
+    print("  stat family (own /proc/<pid>) -> st_uid/st_gid kept stock (profileable only)")
+
+    print()
+    print("Same-uid cross-process /proc reads (ordinary apps only):")
+    print("-" * 72)
+    print("  stock zygote                 -> setresuid resets dumpable to 0")
+    print("                                  (suid_dumpable, SpecializeCommon), so")
+    print("                                  normal apps are already non-dumpable")
+    print("  postAppSpecialize guard      -> re-clears PROFILE_FROM_SHELL apps")
+    print("                                  where zygote sets PR_SET_DUMPABLE=1;")
+    print("                                  ptrace_may_access then denies")
+    print("                                  cat /proc/<pid>/maps, process_vm_readv,")
+    print("                                  PTRACE_ATTACH from the same uid;")
+    print("                                  root/CAP_SYS_PTRACE (debuggerd) still reads")
+    print("  debuggable apps              -> skipped (runtime_flags & DEBUG_ENABLE_DEBUGGER)")
 
     # --- summary ---
     print()

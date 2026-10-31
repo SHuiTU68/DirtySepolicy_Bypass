@@ -9,11 +9,17 @@
 //    policy reloads (sequence/policyload counters) and blocking mmap of it.
 // 4. PLT-hooking libselinux APIs as defense-in-depth against detectors that
 //    still use the userspace library.
-// 5. Handing out scrubbed copies of /proc/{self,thread-self,<pid>}/{
+// 5. Re-clearing PR_SET_DUMPABLE in postAppSpecialize for ordinary apps so
+//    same-uid cross-process readers (forked cat, process_vm_readv, ptrace)
+//    cannot see maps/mem.  Zygote already leaves normal apps non-dumpable;
+//    only profileable ones (PROFILE_FROM_SHELL) need the extra clear, and the
+//    resulting /proc ownership and PR_GET_DUMPABLE answers are masked only
+//    when the flag was actually changed.
+// 6. Handing out scrubbed copies of /proc/{self,thread-self,<pid>}/{
 //    maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,environ},
 //    fd link targets, linker solists and environment variables so a normal app
 //    cannot see the injected Zygisk library (see stealth.cpp).
-// 6. Dropping leaking AVC audit records at the log source and while reading
+// 7. Dropping leaking AVC audit records at the log source and while reading
 //    logcat-style streams (see avc.cpp, ported from ZN-AuditPatch without the
 //    ZygiskNext dependency).
 
@@ -768,6 +774,21 @@ static int register_against_all_libs(zygisk::Api *api) {
         hook("dl_iterate_phdr", (void *)stealth::my_dl_iterate_phdr,
              (void **)&stealth::orig_dl_iterate_phdr);
 
+        // Cross-process /proc readers (forked cat, process_vm_readv, ptrace)
+        // and the tells that dumpable=0 leaves behind.
+        hook("prctl",     (void *)stealth::my_prctl,     (void **)&stealth::orig_prctl);
+        hook("syscall",   (void *)stealth::my_syscall,   (void **)&stealth::orig_syscall);
+        hook("stat",      (void *)stealth::my_stat,      (void **)&stealth::orig_stat);
+        hook("lstat",     (void *)stealth::my_lstat,     (void **)&stealth::orig_lstat);
+        hook("fstat",     (void *)stealth::my_fstat,     (void **)&stealth::orig_fstat);
+        hook("fstatat",   (void *)stealth::my_fstatat,   (void **)&stealth::orig_fstatat);
+#ifdef DSB_HAVE_STAT64
+        hook("stat64",    (void *)stealth::my_stat64,    (void **)&stealth::orig_stat64);
+        hook("lstat64",   (void *)stealth::my_lstat64,   (void **)&stealth::orig_lstat64);
+        hook("fstat64",   (void *)stealth::my_fstat64,   (void **)&stealth::orig_fstat64);
+        hook("fstatat64", (void *)stealth::my_fstatat64, (void **)&stealth::orig_fstatat64);
+#endif
+
         hook("__android_log_write",     (void *)avc::my_log_write,     (void **)&avc::orig_log_write);
         hook("__android_log_buf_write", (void *)avc::my_log_buf_write, (void **)&avc::orig_log_buf_write);
         hook("__android_log_print",     (void *)avc::my_log_print,     (void **)&avc::orig_log_print);
@@ -803,7 +824,16 @@ public:
         // tooling keeps working.
         bool ordinary = args && args->uid >= 10000 &&
                         !(api->getFlags() & zygisk::PROCESS_GRANTED_ROOT);
+        // Leave debuggable apps alone: native/JDWP debuggers need ptrace.
+        bool debuggable = args && (args->runtime_flags & 0x1);
+        proc_guard = ordinary && !debuggable;
         install("app", ordinary);
+    }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+        // Must run after SpecializeCommon: its setresuid / PR_SET_DUMPABLE
+        // calls would overwrite a flag cleared in preAppSpecialize.
+        if (proc_guard) stealth::guard_process();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
@@ -813,6 +843,7 @@ public:
 private:
     zygisk::Api *api = nullptr;
     JNIEnv      *env = nullptr;
+    bool         proc_guard = false;
 
     void install(const char *who, bool app_process) {
         stealth::set_app_mode(app_process);
