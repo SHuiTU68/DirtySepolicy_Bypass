@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .kout
-          key: kout-${{ env.KERNEL_SHA }}-v1
+          key: kout-${{ env.KERNEL_SHA }}-v2
 
       - name: Build dsb_kmod.ko and package the module zip
         run: |

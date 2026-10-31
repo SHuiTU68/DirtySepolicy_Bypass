@@ -40,10 +40,19 @@ fi
 
 mkdir -p "$KERNEL_OUT"
 
-MAKE=(make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm64 LLVM=1 -j"$JOBS")
+LLVM_ARG="${LLVM_ARG:-1}"
+
+MAKE=(make -C "$KERNEL_SRC" O="$KERNEL_OUT" ARCH=arm64 LLVM="$LLVM_ARG" -j"$JOBS")
 
 echo "==> Configuring kernel"
 "${MAKE[@]}" gki_defconfig
+
+# prepare: pulls in tools/bpf/resolve_btfids, whose bundled libbpf does not
+# compile with clang >= 18 (-Werror + -Wincompatible-pointer-types-discards-
+# qualifiers). Module BTF is irrelevant for loadability, so build without it.
+"$KERNEL_SRC/scripts/config" --file "$KERNEL_OUT/.config" \
+    --disable DEBUG_INFO_BTF
+"${MAKE[@]}" olddefconfig >/dev/null
 
 echo "==> Preparing kernel headers"
 "${MAKE[@]}" modules_prepare
