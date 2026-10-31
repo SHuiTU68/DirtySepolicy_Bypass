@@ -782,6 +782,7 @@ static int register_against_all_libs(zygisk::Api *api) {
         hook("lstat",     (void *)stealth::my_lstat,     (void **)&stealth::orig_lstat);
         hook("fstat",     (void *)stealth::my_fstat,     (void **)&stealth::orig_fstat);
         hook("fstatat",   (void *)stealth::my_fstatat,   (void **)&stealth::orig_fstatat);
+        hook("statx",     (void *)stealth::my_statx,     (void **)&stealth::orig_statx);
 #ifdef DSB_HAVE_STAT64
         hook("stat64",    (void *)stealth::my_stat64,    (void **)&stealth::orig_stat64);
         hook("lstat64",   (void *)stealth::my_lstat64,   (void **)&stealth::orig_lstat64);

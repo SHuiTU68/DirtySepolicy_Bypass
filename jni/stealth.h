@@ -36,6 +36,7 @@ extern int      (*orig_stat)(const char *, struct stat *);
 extern int      (*orig_lstat)(const char *, struct stat *);
 extern int      (*orig_fstat)(int, struct stat *);
 extern int      (*orig_fstatat)(int, const char *, struct stat *, int);
+extern int      (*orig_statx)(int, const char *, int, unsigned int, void *);
 #ifdef DSB_HAVE_STAT64
 extern int      (*orig_stat64)(const char *, struct stat64 *);
 extern int      (*orig_lstat64)(const char *, struct stat64 *);
@@ -82,6 +83,7 @@ int     my_stat(const char *path, struct stat *st);
 int     my_lstat(const char *path, struct stat *st);
 int     my_fstat(int fd, struct stat *st);
 int     my_fstatat(int dirfd, const char *path, struct stat *st, int flags);
+int     my_statx(int dirfd, const char *path, int flags, unsigned int mask, void *buf);
 #ifdef DSB_HAVE_STAT64
 int     my_stat64(const char *path, struct stat64 *st);
 int     my_lstat64(const char *path, struct stat64 *st);

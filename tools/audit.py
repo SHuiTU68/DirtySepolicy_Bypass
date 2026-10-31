@@ -409,7 +409,8 @@ def main():
     print("  path match                   -> /data/adb dirs, or module names in")
     print("                                  the final path component / [annotation]")
     print("  prctl/syscall PR_GET_DUMPABLE -> stock value (1 only after our clear)")
-    print("  stat family (own /proc/<pid>) -> st_uid/st_gid kept stock (profileable only)")
+    print("  stat/statx family (own /proc/<pid>) -> st_uid/st_gid stx_uid/stx_gid")
+    print("                                  kept stock (profileable only)")
 
     print()
     print("Same-uid cross-process /proc reads (ordinary apps only):")

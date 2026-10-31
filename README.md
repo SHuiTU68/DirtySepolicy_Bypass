@@ -54,7 +54,7 @@ Duck-Detector adds:
 | `readlink`/`readlinkat` | `/proc/self/fd/*` | `ENOENT` for module/deleted `.so` targets |
 | `dl_iterate_phdr` | linker solist | Hide module entries |
 | `prctl` / `syscall(__NR_prctl)` | `PR_GET_DUMPABLE` | Report the stock value after the profileable clear (answer `1` only when we changed it) |
-| `stat`/`lstat`/`fstat`/`fstatat` (+64-bit variants) | own `/proc/<pid>` subtree | Rewrite `st_uid`/`st_gid` to the app uid (profileable case only) |
+| `stat`/`lstat`/`fstat`/`fstatat`/`statx` (+64-bit variants) | own `/proc/<pid>` subtree | Rewrite `st_uid`/`st_gid` / `stx_uid`/`stx_gid` to the app uid (profileable case only) |
 | `getenv`/`secure_getenv` | `TMP_PATH`, `MAGISK*`, `ZYGISK*`, … | Return `NULL` |
 | `__android_log_write/buf_write/print/vprint` | AVC audit records | Drop leaking lines at the source |
 | `read`/`pread64` (≤8 KiB) | logcat-style streams | Drop leaking AVC lines that come back |
@@ -126,9 +126,9 @@ every app and system_server process.
   zygote raises `PR_SET_DUMPABLE` back to 1; `guard_process()` runs in
   `postAppSpecialize` (a `preAppSpecialize` clear would be overwritten by
   specialization) and clears it again. Only when the flag really changed from
-  the user-dumpable state are the side effects masked: the stat family rewrites
-  the now root-owned `/proc/<pid>` inodes back to the app uid, and both
-  `prctl(PR_GET_DUMPABLE)` and `syscall(__NR_prctl, ...)` answer `1`.
+  the user-dumpable state are the side effects masked: the stat family (including
+  `statx`) rewrites the now root-owned `/proc/<pid>` inodes back to the app uid,
+  and both `prctl(PR_GET_DUMPABLE)` and `syscall(__NR_prctl, ...)` answer `1`.
   Root/CAP_SYS_PTRACE readers (debuggerd, tombstones, `dumpsys`) still work.
   Debuggable apps (`runtime_flags & DEBUG_ENABLE_DEBUGGER`) are skipped so
   native/JDWP debugging keeps working.
@@ -255,8 +255,7 @@ Rebuild, reflash, reboot, re-audit.
   nothing to observe. For `PROFILE_FROM_SHELL` apps the module clears dumpable
   where stock would have allowed the read; a detector that profiles its own
   process and expects that succeeded read can treat `EACCES` as a signal.
-  `statx` is not hooked, so one on a profileable app sees the root-owned
-  `/proc/<pid>` inode instead of the app uid. Debuggable apps keep dumpable=1.
+  Debuggable apps keep dumpable=1.
 - **Raw syscalls and memory scans.** Code that issues `syscall()` inline
   instead of through libc's PLT, or scans its own heap/ELF for module strings,
   bypasses these userspace hooks (the `syscall` wrapper is hooked, inline

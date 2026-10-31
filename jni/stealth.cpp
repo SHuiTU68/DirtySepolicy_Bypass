@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -59,6 +60,7 @@ int      (*orig_stat)(const char *, struct stat *) = nullptr;
 int      (*orig_lstat)(const char *, struct stat *) = nullptr;
 int      (*orig_fstat)(int, struct stat *) = nullptr;
 int      (*orig_fstatat)(int, const char *, struct stat *, int) = nullptr;
+int      (*orig_statx)(int, const char *, int, unsigned int, void *) = nullptr;
 #ifdef DSB_HAVE_STAT64
 int      (*orig_stat64)(const char *, struct stat64 *) = nullptr;
 int      (*orig_lstat64)(const char *, struct stat64 *) = nullptr;
@@ -680,6 +682,8 @@ static bool fd_is_self_proc(int fd) {
 
 static bool at_is_self_proc(int dirfd, const char *path) {
     if (!path) return false;
+    // AT_EMPTY_PATH: the directory fd itself refers to the file.
+    if (path[0] == '\0') return dirfd >= 0 && fd_is_self_proc(dirfd);
     if (path[0] == '/') return proc_path_self(path);
     if (dirfd < 0) return false;
     char target[256];
@@ -692,6 +696,35 @@ static void fix_owner(StatT *st) {
     if (!st) return;
     st->st_uid = getuid();
     st->st_gid = getgid();
+}
+
+// Kernel uapi struct statx layout (include/uapi/linux/stat.h), mirrored so the
+// wrapper does not depend on NDK headers gated behind __ANDROID_API__ >= 30.
+// Only the uid/gid prefix is touched; the caller owns the full 256-byte buffer.
+struct DsbStatx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t _spare0;
+    uint8_t  _tail[256 - 30];
+};
+static_assert(offsetof(DsbStatx, stx_uid) == 20, "statx prefix layout");
+static_assert(offsetof(DsbStatx, stx_gid) == 24, "statx prefix layout");
+
+int my_statx(int dirfd, const char *path, int flags, unsigned int mask, void *buf) {
+    if (!orig_statx) { errno = ENOSYS; return -1; }
+    int r = orig_statx(dirfd, path, flags, mask, buf);
+    if (r == 0 && g_app_mode && g_dumpable_spoof && buf &&
+        at_is_self_proc(dirfd, path)) {
+        auto *sx = static_cast<DsbStatx *>(buf);
+        sx->stx_uid = static_cast<uint32_t>(getuid());
+        sx->stx_gid = static_cast<uint32_t>(getgid());
+    }
+    return r;
 }
 
 int my_prctl(int option, ...) {
