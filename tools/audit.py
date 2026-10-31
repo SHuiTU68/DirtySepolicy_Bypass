@@ -155,7 +155,10 @@ HOOK_BLOCKLIST = [
     ":lsposed", ":xposed", ":riru",
     ":adbroot",
     ":supersu", ":supolicy", ":su:",
-    ":zygisk",
+    ":zygisk", ":shamiko", ":zygisknext", ":zygisksu",
+    ":neozygisk", ":rezygisk",
+    ":droidspacesd", ":msd_app", ":msd_daemon",
+    ":auditpatch",
 ]
 
 HOOK_HIDDEN_PERMS = ["execmem"]
@@ -167,6 +170,7 @@ HOOK_EXACT_PROBES = [
     ("u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"),
     ("u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"),
     ("u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"),
+    ("u:r:fsck_untrusted:s0", "u:r:fsck_untrusted:s0", "capability", "sys_admin"),
 ]
 
 
@@ -212,6 +216,16 @@ ACCESS_PROBES = [
     ("LSPosed apk execute",    "u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"),
     ("Xposed dex2oat exec",    "u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"),
     ("ZygiskNext dir search",  "u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"),
+    # Duck-Detector dirty-policy oracles
+    ("Duck fsck sys_admin",    "u:r:fsck_untrusted:s0", "u:r:fsck_untrusted:s0", "capability", "sys_admin"),
+    ("Duck adbd->adbroot",     "u:r:adbd:s0",          "u:r:adbroot:s0",       "binder",     "call"),
+    ("Duck untrusted->magisk", "u:r:untrusted_app:s0", "u:r:magisk:s0",        "binder",     "call"),
+    ("Duck ksu_file read",     "u:r:untrusted_app:s0", "u:object_r:ksu_file:s0", "file",     "read"),
+    ("Duck lsposed_file read", "u:r:untrusted_app:s0", "u:object_r:lsposed_file:s0", "file", "read"),
+    ("Duck xposed_data read",  "u:r:untrusted_app:s0", "u:object_r:xposed_data:s0", "file",  "read"),
+    ("Duck droidspacesd dytr", "u:r:untrusted_app:s0", "u:r:droidspacesd:s0",  "process",    "dyntransition"),
+    ("Duck msd_app connectto", "u:r:untrusted_app:s0", "u:r:msd_app:s0",       "unix_stream_socket", "connectto"),
+    ("Duck msd_daemon selinux","u:r:msd_daemon:s0",    "u:object_r:selinuxfs:s0", "dir",     "search"),
 ]
 
 FUTURE_PROBES = [
@@ -230,7 +244,8 @@ FUTURE_PROBES = [
 SUSPICIOUS_NAMES = [
     "magisk", "ksu", "kernelsu", "lsposed", "xposed", "riru",
     "supersu", "zygisk", "apatch", "shamiko", "kitsune", "adbroot",
-    "supolicy", "su_daemon",
+    "supolicy", "su_daemon", "droidspacesd", "msd_app", "msd_daemon",
+    "auditpatch", "neozygisk", "rezygisk",
 ]
 
 STOCK_FP = {"su"}
@@ -369,9 +384,21 @@ def main():
             if not covered:
                 leaks.append(("type", name, "not in blocklist"))
 
+    # --- Duck-Detector extra surfaces ---
+    print()
+    print("Duck-Detector surfaces:")
+    print("-" * 72)
+    print("  /sys/fs/selinux/status mmap   -> hook refuses mmap (EACCES)")
+    print("  /sys/fs/selinux/avc/cache_stats -> counters zeroed on read")
+    print("  audit / logcat AVC records    -> __android_log_* + read() filtering")
+    print("  /data/adb/modules/auditpatch  -> not shipped (no residue)")
+    fake = "u:r:priv_app:s0:c512,c768"
+    print(f"  fake tcontext {fake!r} -> never synthesized")
+
     # --- summary ---
     print()
     print("=" * 72)
+
     if leaks:
         print(f"{color('LEAKS', 'red')}: {len(leaks)} issue(s) a detector could exploit")
         print()

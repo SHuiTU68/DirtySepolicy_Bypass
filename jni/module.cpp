@@ -1,30 +1,41 @@
 // DirtySepolicy Bypass — Zygisk module
 //
-// Defeats DirtySepolicy v2.0–v2.2 detection by:
+// Defeats DirtySepolicy v2.0–v2.2 detection and the Duck-Detector probe set by:
 // 1. Intercepting reads/writes to /sys/fs/selinux/access to hide framework
 //    allow rules and fix the avdSeqNo counter.
 // 2. Intercepting writes to /sys/fs/selinux/context and /proc/self/attr/current
 //    to hide framework SELinux types from contextExists() checks.
 // 3. Intercepting reads from /sys/fs/selinux/status to hide evidence of
-//    policy reloads (sequence/policyload counters).
-// 4. PLT-hooking libselinux APIs as defense-in-depth against detectors
-//    that still use the userspace library.
+//    policy reloads (sequence/policyload counters) and blocking mmap of it.
+// 4. PLT-hooking libselinux APIs as defense-in-depth against detectors that
+//    still use the userspace library.
+// 5. Handing out scrubbed copies of /proc/self/{maps,smaps,status,comm}, fd
+//    link targets, linker solists and environment variables so a normal app
+//    cannot see the injected library (see stealth.cpp).
+// 6. Dropping leaking AVC audit records at the log source and while reading
+//    logcat-style streams (see avc.cpp, ported from ZN-AuditPatch without the
+//    ZygiskNext dependency).
 
-#include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 
 #include <android/log.h>
 #include "zygisk.hpp"
+#include "rules.h"
+#include "stealth.h"
+#include "avc.h"
 
-#define LOG_TAG "DirtySepBypass"
+#define LOG_TAG "selinuxfs"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #ifdef DEBUG
@@ -42,22 +53,8 @@ void  operator delete[] (void *p, size_t) noexcept { free(p); }
 
 // ---- hidden context substrings ------------------------------------------
 
-static const char *const kHidden[] = {
-    ":magisk",     ":kitsune",    ":apatch",
-    ":ksu",        ":kernelsu",
-    ":lsposed",    ":xposed",     ":riru",
-    ":adbroot",
-    ":supersu",    ":supolicy",   ":su:",
-    ":zygisk",
-    nullptr,
-};
-
 static inline bool is_hidden(const char *con) {
-    if (!con) return false;
-    for (int i = 0; kHidden[i]; ++i) {
-        if (strstr(con, kHidden[i])) return true;
-    }
-    return false;
+    return dsb::hidden_context(con);
 }
 
 // ---- exact-match probes (stock contexts, framework-injected rules) ------
@@ -76,6 +73,8 @@ static const ExactProbe kHiddenExact[] = {
     {"u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"},
     {"u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"},
     {"u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"},
+    // Duck-Detector "fsck_untrusted sys_admin" oracle.
+    {"u:r:fsck_untrusted:s0", "u:r:fsck_untrusted:s0", "capability", "sys_admin"},
     {nullptr, nullptr, nullptr, nullptr},
 };
 
@@ -203,6 +202,8 @@ enum FdType : unsigned char {
     FD_CONTEXT,
     FD_ACCESS,
     FD_STATUS,
+    FD_POLICY,
+    FD_AVC_STATS,
 };
 
 struct TrackedFd {
@@ -267,6 +268,8 @@ static FdType classify_path(const char *path) {
     if (name) {
         if (strcmp(name, "access") == 0)  return FD_ACCESS;
         if (strcmp(name, "status") == 0)  return FD_STATUS;
+        if (strcmp(name, "policy") == 0)  return FD_POLICY;
+        if (strcmp(name, "avc/cache_stats") == 0) return FD_AVC_STATS;
         if (strcmp(name, "context") == 0 ||
             strcmp(name, "create") == 0 ||
             strcmp(name, "member") == 0 ||
@@ -368,6 +371,32 @@ static void patch_status(void *buf, ssize_t len) {
     memcpy(p + 4,  &seq,   sizeof(seq));
     memcpy(p + 12, &pload, sizeof(pload));
     LOGD("patch_status: seq=%u->%u policyload=%u->%u", raw_seq, seq, raw_pload, pload);
+}
+
+// ---- read-side scrubbing ------------------------------------------------
+
+static ssize_t scrub_read_content(int fd, void *buf, ssize_t ret) {
+    if (ret <= 0 || !buf) return ret;
+
+    auto *tfd = find_tracked(fd);
+    if (tfd && tfd->type == FD_POLICY) {
+        stealth::scrub_policy(static_cast<char *>(buf), (size_t)ret);
+        return ret;
+    }
+
+    // avc/cache_stats is tiny; match on content so fopen-based reads are
+    // covered even when the fd was not opened through the PLT hook.
+    if ((size_t)ret <= 512 &&
+        dsb::mem_contains(buf, (size_t)ret, "lookups hits")) {
+        stealth::scrub_avc_stats(static_cast<char *>(buf), (size_t)ret);
+    }
+
+    // logcat / removed-event buffers are small; filter leaking AVC records.
+    if ((size_t)ret <= 8192) {
+        ret = static_cast<ssize_t>(
+            avc::filter_buffer(buf, static_cast<size_t>(ret)));
+    }
+    return ret;
 }
 
 // ---- libselinux ABI (defense-in-depth hooks) ----------------------------
@@ -496,17 +525,26 @@ static ssize_t (*orig_write)(int, const void *, size_t) = nullptr;
 static ssize_t (*orig_read)(int, void *, size_t) = nullptr;
 static ssize_t (*orig_pread64)(int, void *, size_t, off64_t) = nullptr;
 static int     (*orig_close)(int) = nullptr;
+static void   *(*orig_mmap)(void *, size_t, int, int, int, off_t) = nullptr;
+static void   *(*orig_mmap64)(void *, size_t, int, int, int, off64_t) = nullptr;
 
+#ifdef DEBUG
 static const char *fdtype_str(FdType t) {
     switch (t) {
-        case FD_CONTEXT: return "context";
-        case FD_ACCESS:  return "access";
-        case FD_STATUS:  return "status";
-        default:         return "none";
+        case FD_CONTEXT:   return "context";
+        case FD_ACCESS:    return "access";
+        case FD_STATUS:    return "status";
+        case FD_POLICY:    return "policy";
+        case FD_AVC_STATS: return "avc";
+        default:           return "none";
     }
 }
+#endif
 
 static int my_open(const char *pathname, int flags, mode_t mode) {
+    int virtual_fd = stealth::open_virtual(pathname);
+    if (virtual_fd >= 0) return virtual_fd;
+
     int fd = orig_open ? orig_open(pathname, flags, mode) : -1;
     if (fd >= 0) {
         FdType type = classify_path(pathname);
@@ -519,6 +557,9 @@ static int my_open(const char *pathname, int flags, mode_t mode) {
 }
 
 static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+    int virtual_fd = stealth::open_virtual(pathname);
+    if (virtual_fd >= 0) return virtual_fd;
+
     int fd = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
     if (fd >= 0) {
         FdType type = classify_path(pathname);
@@ -557,43 +598,96 @@ static ssize_t my_write(int fd, const void *buf, size_t count) {
 static ssize_t my_read(int fd, void *buf, size_t count) {
     if (!orig_read) { errno = ENOSYS; return -1; }
     ssize_t ret = orig_read(fd, buf, count);
-    if (ret <= 0 || g_tracked_count == 0) return ret;
+    if (ret <= 0) return ret;
 
     auto *tfd = find_tracked(fd);
-    if (!tfd) return ret;
-
-    if (tfd->type == FD_ACCESS && tfd->has_query) {
-        ret = patch_access_response(tfd, (char *)buf, ret, count);
-        tfd->has_query = false;
-    } else if (tfd->type == FD_STATUS) {
-        patch_status(buf, ret);
+    if (tfd) {
+        if (tfd->type == FD_ACCESS && tfd->has_query) {
+            ret = patch_access_response(tfd, (char *)buf, ret, count);
+            tfd->has_query = false;
+        } else if (tfd->type == FD_STATUS) {
+            patch_status(buf, ret);
+        }
     }
 
-    return ret;
+    return scrub_read_content(fd, buf, ret);
 }
 
 static ssize_t my_pread64(int fd, void *buf, size_t count, off64_t offset) {
     if (!orig_pread64) { errno = ENOSYS; return -1; }
     ssize_t ret = orig_pread64(fd, buf, count, offset);
-    if (ret <= 0 || g_tracked_count == 0) return ret;
+    if (ret <= 0) return ret;
 
     auto *tfd = find_tracked(fd);
-    if (!tfd) return ret;
-
-    if (tfd->type == FD_ACCESS && tfd->has_query) {
-        ret = patch_access_response(tfd, (char *)buf, ret, count);
-        tfd->has_query = false;
-    } else if (tfd->type == FD_STATUS) {
-        patch_status(buf, ret);
+    if (tfd) {
+        if (tfd->type == FD_ACCESS && tfd->has_query) {
+            ret = patch_access_response(tfd, (char *)buf, ret, count);
+            tfd->has_query = false;
+        } else if (tfd->type == FD_STATUS) {
+            patch_status(buf, ret);
+        }
     }
 
-    return ret;
+    return scrub_read_content(fd, buf, ret);
 }
 
 static int my_close(int fd) {
     if (g_tracked_count > 0)
         untrack_fd(fd);
     return orig_close ? orig_close(fd) : -1;
+}
+
+// Duck-Detector mmaps /sys/fs/selinux/status looking for a second page with
+// writable permissions. Refuse mmap for status fds instead of handing out a
+// doctored mapping. Fds opened through libc's internal helpers are not tracked,
+// so verify the fd target with a raw readlinkat as a fallback.
+static bool fd_is_selinux_status(int fd) {
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    char target[256];
+#ifdef __NR_readlinkat
+    long n = syscall(__NR_readlinkat, AT_FDCWD, link, target, sizeof(target) - 1);
+#else
+    long n = syscall(__NR_readlink, link, target, sizeof(target) - 1);
+#endif
+    if (n <= 0) return false;
+    target[n] = '\0';
+    return strstr(target, "selinux/status") != nullptr;
+}
+
+static void *my_mmap(void *addr, size_t len, int prot, int flags, int fd,
+                     off_t offset) {
+    if (g_tracked_count > 0) {
+        auto *tfd = find_tracked(fd);
+        if (tfd && tfd->type == FD_STATUS) {
+            errno = EACCES;
+            return MAP_FAILED;
+        }
+    }
+    if (fd >= 0 && len <= 8192 && fd_is_selinux_status(fd)) {
+        errno = EACCES;
+        return MAP_FAILED;
+    }
+    if (!orig_mmap) { errno = ENOSYS; return MAP_FAILED; }
+    return orig_mmap(addr, len, prot, flags, fd, offset);
+}
+
+static void *my_mmap64(void *addr, size_t len, int prot, int flags, int fd,
+                        off64_t offset) {
+    if (g_tracked_count > 0) {
+        auto *tfd = find_tracked(fd);
+        if (tfd && tfd->type == FD_STATUS) {
+            errno = EACCES;
+            return MAP_FAILED;
+        }
+    }
+    if (fd >= 0 && len <= 8192 && fd_is_selinux_status(fd)) {
+        errno = EACCES;
+        return MAP_FAILED;
+    }
+    if (orig_mmap64) return orig_mmap64(addr, len, prot, flags, fd, offset);
+    if (!orig_mmap) { errno = ENOSYS; return MAP_FAILED; }
+    return orig_mmap(addr, len, prot, flags, fd, static_cast<off_t>(offset));
 }
 
 // ---- map walking --------------------------------------------------------
@@ -618,28 +712,42 @@ static int register_against_all_libs(zygisk::Api *api) {
         struct stat st;
         if (stat(path, &st) != 0) { LOGD("register: stat(%s) failed: %s", path, strerror(errno)); continue; }
 
-        api->pltHookRegister(st.st_dev, st.st_ino, "open",
-                             (void *)my_open,   (void **)&orig_open);
-        api->pltHookRegister(st.st_dev, st.st_ino, "openat",
-                             (void *)my_openat, (void **)&orig_openat);
-        api->pltHookRegister(st.st_dev, st.st_ino, "write",
-                             (void *)my_write,  (void **)&orig_write);
-        api->pltHookRegister(st.st_dev, st.st_ino, "read",
-                             (void *)my_read,   (void **)&orig_read);
-        api->pltHookRegister(st.st_dev, st.st_ino, "pread64",
-                             (void *)my_pread64, (void **)&orig_pread64);
-        api->pltHookRegister(st.st_dev, st.st_ino, "close",
-                             (void *)my_close,  (void **)&orig_close);
+        auto hook = [&](const char *sym, void *fn, void **old) {
+            api->pltHookRegister(st.st_dev, st.st_ino, sym, fn, old);
+        };
 
-        api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av",
-                             (void *)my_security_compute_av,
-                             (void **)&orig_security_compute_av);
-        api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av_flags",
-                             (void *)my_security_compute_av_flags,
-                             (void **)&orig_security_compute_av_flags);
-        api->pltHookRegister(st.st_dev, st.st_ino, "selinux_check_access",
-                             (void *)my_selinux_check_access,
-                             (void **)&orig_selinux_check_access);
+        hook("open",      (void *)my_open,           (void **)&orig_open);
+        hook("openat",    (void *)my_openat,         (void **)&orig_openat);
+        hook("write",     (void *)my_write,          (void **)&orig_write);
+        hook("read",      (void *)my_read,           (void **)&orig_read);
+        hook("pread64",   (void *)my_pread64,        (void **)&orig_pread64);
+        hook("close",     (void *)my_close,          (void **)&orig_close);
+        hook("mmap",      (void *)my_mmap,           (void **)&orig_mmap);
+        hook("mmap64",    (void *)my_mmap64,         (void **)&orig_mmap64);
+
+        hook("fopen",     (void *)stealth::my_fopen,     (void **)&stealth::orig_fopen);
+        hook("fopen64",   (void *)stealth::my_fopen64,   (void **)&stealth::orig_fopen64);
+        hook("readlink",  (void *)stealth::my_readlink,  (void **)&stealth::orig_readlink);
+        hook("readlinkat", (void *)stealth::my_readlinkat, (void **)&stealth::orig_readlinkat);
+        hook("getenv",    (void *)stealth::my_getenv,    (void **)&stealth::orig_getenv);
+        hook("secure_getenv", (void *)stealth::my_secure_getenv, (void **)&stealth::orig_secure_getenv);
+        hook("dl_iterate_phdr", (void *)stealth::my_dl_iterate_phdr,
+             (void **)&stealth::orig_dl_iterate_phdr);
+
+        hook("__android_log_write",     (void *)avc::my_log_write,     (void **)&avc::orig_log_write);
+        hook("__android_log_buf_write", (void *)avc::my_log_buf_write, (void **)&avc::orig_log_buf_write);
+        hook("__android_log_print",     (void *)avc::my_log_print,     (void **)&avc::orig_log_print);
+        hook("__android_log_vprint",    (void *)avc::my_log_vprint,    (void **)&avc::orig_log_vprint);
+
+        hook("security_compute_av",
+             (void *)my_security_compute_av,
+             (void **)&orig_security_compute_av);
+        hook("security_compute_av_flags",
+             (void *)my_security_compute_av_flags,
+             (void **)&orig_security_compute_av_flags);
+        hook("selinux_check_access",
+             (void *)my_selinux_check_access,
+             (void **)&orig_selinux_check_access);
         ++n;
     }
     fclose(fp);
@@ -656,18 +764,19 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *) override {
-        install("app");
+        install("app", true);
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
-        install("server");
+        install("server", false);
     }
 
 private:
     zygisk::Api *api = nullptr;
     JNIEnv      *env = nullptr;
 
-    void install(const char *who) {
+    void install(const char *who, bool app_process) {
+        stealth::set_app_mode(app_process);
         detect_kernel_version();
         resolve_hidden_bits();
         int n = register_against_all_libs(api);
