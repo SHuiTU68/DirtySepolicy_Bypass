@@ -160,38 +160,17 @@ static bool fmt_needs_inspection(const char *fmt) {
 }
 
 int my_log_print(int prio, const char *tag, const char *fmt, ...) {
+    if (!fmt) return 0;
     va_list ap;
     va_start(ap, fmt);
-
-    char buf[1024];
-    int n = -1;
-    if (fmt_needs_inspection(fmt)) {
-        va_list ap2;
-        va_copy(ap2, ap);
-        n = vsnprintf(buf, sizeof(buf), fmt, ap2);
-        va_end(ap2);
-        if (n > 0 && text_self_exposes(tag, buf,
-                                       static_cast<size_t>(n) < sizeof(buf)
-                                           ? static_cast<size_t>(n)
-                                           : sizeof(buf) - 1)) {
-            va_end(ap);
-            return 0;
-        }
-    }
-
-    int r;
-    if (orig_log_print) {
-        r = orig_log_print(prio, tag, fmt, ap);
-    } else if (n > 0 && orig_log_write) {
-        r = orig_log_write(prio, tag, buf);
-    } else {
-        r = 0;
-    }
+    int r = my_log_vprint(prio, tag, fmt, ap);
     va_end(ap);
     return r;
 }
 
 int my_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+    if (!fmt) return 0;
+
     char buf[1024];
     int n = -1;
     if (fmt_needs_inspection(fmt)) {
@@ -206,8 +185,18 @@ int my_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
             return 0;
     }
 
+    // The va_list must never be forwarded as a variadic argument (UB: the
+    // callee then reads the va_list struct itself as its first argument).
     if (orig_log_vprint) return orig_log_vprint(prio, tag, fmt, ap);
-    if (n > 0 && orig_log_write) return orig_log_write(prio, tag, buf);
+
+    // No vprint entry point resolved: format once and use the plain writer.
+    // vsnprintf() consumes the list, so hand it a copy.
+    va_list ap3;
+    va_copy(ap3, ap);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap3);
+    va_end(ap3);
+    if (n < 0) return 0;
+    if (orig_log_write) return orig_log_write(prio, tag, buf);
     return 0;
 }
 

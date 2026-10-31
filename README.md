@@ -60,8 +60,15 @@ Duck-Detector adds:
 | `read`/`pread64` (≤8 KiB) | logcat-style streams | Drop leaking AVC lines that come back |
 | `selinux_check_access` / `security_compute_av(_flags)` | libselinux API | Same masking, for library-based detectors |
 
-All hooks are installed with Zygisk PLT hooking across every loaded `.so` in
-every app and system_server process.
+Hooks are installed with Zygisk PLT hooking, but only on the libraries that
+actually host the probes: `libjavacore.so`, `libandroid_runtime.so`,
+`libselinux.so`, `libnativehelper.so` and the app's own libraries under
+`/data/app/`. Each `(dev, ino)` pair is registered once (a `.so` shows up as
+three or four maps segments) and the total is budgeted, because Zygisk
+providers keep a fixed-size pending-hook table. `system_server` (uid 1000) is
+left completely untouched — it maps the largest library set, and one bad hook
+there kills system_server, which takes zygote and the whole boot down with it.
+App zygotes (uid ≥ 10000), where DirtySepolicy actually probes from, are hooked.
 
 ## Hidden type patterns (`jni/rules.h`)
 
@@ -132,13 +139,17 @@ every app and system_server process.
   Root/CAP_SYS_PTRACE readers (debuggerd, tombstones, `dumpsys`) still work.
   Debuggable apps (`runtime_flags & DEBUG_ENABLE_DEBUGGER`) are skipped so
   native/JDWP debugging keeps working. The spoof hooks (`prctl`, `syscall`,
-  stat family, `statx`) are registered lazily and only in that process, so
-  ordinary apps and `system_server` keep the plain hook set.
+  stat family, `statx`) are registered in the same single `pltHookCommit()`
+  batch as the rest (a second commit is not portable across Zygisk providers),
+  but they are only registered for ordinary apps and they forward untouched
+  until `guard_process()` signals that it really cleared the flag.
 
 Scrubbing is enabled **only for ordinary, non-root app processes** (uid ≥
-10000 and without `PROCESS_GRANTED_ROOT`). Root-granted apps and
-`system_server` keep the real `/data/adb` mappings, fd targets and linker
-solist, so root tooling and the shell are unaffected.
+10000 and without `PROCESS_GRANTED_ROOT`), and the hooks only reach ordinary
+apps and app zygotes. Root-granted apps and `system_server` are not
+instrumented at all, so they keep the real `/data/adb` mappings, fd targets,
+linker solist and a pristine log path; root tooling and the shell are
+unaffected.
 
 `jni/avc.cpp` is a ZygiskNext-free port of [ZN-AuditPatch](https://github.com/aviraxp/ZN-AuditPatch):
 instead of injecting `logd` it drops leaking AVC records from
@@ -157,7 +168,7 @@ Two supported paths:
 # Local build (Android NDK r26+ and python3):
 export ANDROID_NDK_HOME=/path/to/ndk
 ./tools/build.sh
-# -> dist/dirtysepbypass-v4.2.0.zip
+# -> dist/dirtysepbypass-v4.2.1.zip
 ```
 
 `tools/build.sh` runs `ndk-build` for arm64-v8a, armeabi-v7a, x86 and x86_64,

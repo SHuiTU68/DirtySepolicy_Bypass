@@ -12,10 +12,11 @@
 // 5. Re-clearing PR_SET_DUMPABLE in postAppSpecialize so same-uid
 //    cross-process readers (forked cat, process_vm_readv, ptrace) cannot see
 //    maps/mem.  Zygote already leaves normal apps non-dumpable; only
-//    profileable ones (PROFILE_FROM_SHELL) need the extra clear.  The
-//    stat/statx/prctl spoof hooks are registered lazily and only in the
-//    process that was actually cleared, never in ordinary apps or
-//    system_server.
+//    profileable ones (PROFILE_FROM_SHELL) need the extra clear.  The spoof
+//    hooks (prctl/syscall/stat/statx) are always registered in the same batch
+//    as the rest (a second pltHookCommit() call is not portable across Zygisk
+//    providers), but they only rewrite results when guard_process() really
+//    changed the flag; otherwise they forward untouched.
 // 6. Handing out scrubbed copies of /proc/{self,thread-self,<pid>}/{
 //    maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,environ},
 //    fd link targets, linker solists and environment variables so a normal app
@@ -568,9 +569,19 @@ static void track_if_needed(int fd, const char *pathname) {
     }
 }
 
+// Only a plain read-only open can be replaced by a memfd: handing one back for
+// O_PATH / O_DIRECTORY / O_WRONLY / O_RDWR would break callers that fstat,
+// openat(AT_EMPTY_PATH) or write through the descriptor.
+static bool virtualizable(int flags) {
+    return (flags & (O_WRONLY | O_RDWR | O_PATH | O_DIRECTORY | O_CREAT |
+                     O_TRUNC | O_APPEND)) == 0;
+}
+
 static int my_open(const char *pathname, int flags, mode_t mode) {
-    int virtual_fd = stealth::open_virtual(pathname);
-    if (virtual_fd >= 0) return virtual_fd;
+    if (virtualizable(flags)) {
+        int virtual_fd = stealth::open_virtual(pathname);
+        if (virtual_fd >= 0) return virtual_fd;
+    }
 
     int fd = orig_open ? orig_open(pathname, flags, mode) : -1;
     track_if_needed(fd, pathname);
@@ -578,8 +589,10 @@ static int my_open(const char *pathname, int flags, mode_t mode) {
 }
 
 static int my_open64(const char *pathname, int flags, mode_t mode) {
-    int virtual_fd = stealth::open_virtual(pathname);
-    if (virtual_fd >= 0) return virtual_fd;
+    if (virtualizable(flags)) {
+        int virtual_fd = stealth::open_virtual(pathname);
+        if (virtual_fd >= 0) return virtual_fd;
+    }
 
     int fd;
     if (orig_open64)             fd = orig_open64(pathname, flags, mode);
@@ -590,8 +603,10 @@ static int my_open64(const char *pathname, int flags, mode_t mode) {
 }
 
 static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-    int virtual_fd = stealth::open_virtual(pathname);
-    if (virtual_fd >= 0) return virtual_fd;
+    if (virtualizable(flags)) {
+        int virtual_fd = stealth::open_virtual(pathname);
+        if (virtual_fd >= 0) return virtual_fd;
+    }
 
     int fd = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
     track_if_needed(fd, pathname);
@@ -599,8 +614,10 @@ static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
 }
 
 static int my_openat64(int dirfd, const char *pathname, int flags, mode_t mode) {
-    int virtual_fd = stealth::open_virtual(pathname);
-    if (virtual_fd >= 0) return virtual_fd;
+    if (virtualizable(flags)) {
+        int virtual_fd = stealth::open_virtual(pathname);
+        if (virtual_fd >= 0) return virtual_fd;
+    }
 
     int fd;
     if (orig_openat64)           fd = orig_openat64(dirfd, pathname, flags, mode);
@@ -730,6 +747,34 @@ static void *my_mmap64(void *addr, size_t len, int prot, int flags, int fd,
 }
 
 // ---- map walking --------------------------------------------------------
+//
+// Zygisk providers keep their pending-PLT-hook list in a fixed-size table.  A
+// stock app maps well over a hundred `.so` files and *each file shows up as
+// three or four maps segments*, so registering a hook for every maps line
+// explodes into thousands of records -- enough to overflow that table and take
+// the whole Zygisk runtime (zygote injection) down with it.  Only the
+// libraries that actually host the probes are registered, and each (dev, ino)
+// is visited once:
+//   * libjavacore / libandroid_runtime: every Java-side file, stat, readlink,
+//     getenv and log call (FileInputStream, Os.stat, Runtime.exec plumbing),
+//   * libselinux / libnativehelper: direct SELinux API calls,
+//   * anything loaded from the app's own lib dir (native detectors).
+#define MAX_HOOK_LIBS  24
+#define MAX_HOOK_CALLS 320
+
+static bool lib_wanted(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    static const char *const kLibs[] = {
+        "libjavacore.so", "libandroid_runtime.so", "libselinux.so",
+        "libnativehelper.so", nullptr,
+    };
+    for (int i = 0; kLibs[i]; ++i)
+        if (strcmp(base, kLibs[i]) == 0) return true;
+    return strstr(path, "/data/app/") != nullptr;
+}
+
+struct HookLib { dev_t dev; ino_t ino; };
 
 static int register_against_all_libs(zygisk::Api *api, bool guard) {
     FILE *fp = fopen("/proc/self/maps", "re");
@@ -737,30 +782,43 @@ static int register_against_all_libs(zygisk::Api *api, bool guard) {
         LOGW("fopen(/proc/self/maps) failed: %s", strerror(errno));
         return 0;
     }
-    int n = 0;
+    HookLib seen[MAX_HOOK_LIBS];
+    int seen_n = 0, calls = 0, n = 0;
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         char *path = strchr(line, '/');
         if (!path) continue;
         size_t len = strlen(path);
-        if (len < 4) continue;
         if (path[len - 1] == '\n') { path[len - 1] = '\0'; len--; }
         if (len < 4) continue;
         if (strcmp(path + len - 3, ".so") != 0) continue;
+        if (strstr(path, "(deleted)") != nullptr) continue;
+        if (!lib_wanted(path)) continue;
 
         struct stat st;
         if (stat(path, &st) != 0) { LOGD("register: stat(%s) failed: %s", path, strerror(errno)); continue; }
 
+        bool dup = false;
+        for (int i = 0; i < seen_n; ++i) {
+            if (seen[i].dev == st.st_dev && seen[i].ino == st.st_ino) { dup = true; break; }
+        }
+        if (dup) continue;
+        if (seen_n >= MAX_HOOK_LIBS) { LOGW("register: lib budget reached (%d)", seen_n); break; }
+        seen[seen_n].dev = st.st_dev;
+        seen[seen_n].ino = st.st_ino;
+        ++seen_n;
+
         auto hook = [&](const char *sym, void *fn, void **old) {
+            if (calls >= MAX_HOOK_CALLS) return;
             api->pltHookRegister(st.st_dev, st.st_ino, sym, fn, old);
+            ++calls;
         };
 
         if (guard) {
-            // Installed lazily, only in the rare process where guard_process()
-            // actually cleared a user-dumpable flag.  Registering these for
-            // every app (and system_server) is too invasive: the syscall/stat
-            // wrappers sit on very hot paths and any mistake there takes the
-            // whole Zygisk provider down with it.
+            // Dumpable spoof.  These sit on hot paths, so they are only
+            // registered for processes that can actually need them (ordinary,
+            // non-debuggable apps) and the wrappers forward untouched unless
+            // guard_process() really cleared PR_SET_DUMPABLE.
             hook("prctl",     (void *)stealth::my_prctl,     (void **)&stealth::orig_prctl);
             hook("syscall",   (void *)stealth::my_syscall,   (void **)&stealth::orig_syscall);
             hook("stat",      (void *)stealth::my_stat,      (void **)&stealth::orig_stat);
@@ -774,7 +832,8 @@ static int register_against_all_libs(zygisk::Api *api, bool guard) {
             hook("fstat64",   (void *)stealth::my_fstat64,   (void **)&stealth::orig_fstat64);
             hook("fstatat64", (void *)stealth::my_fstatat64, (void **)&stealth::orig_fstatat64);
 #endif
-        } else {
+        }
+
         hook("open",      (void *)my_open,           (void **)&orig_open);
         hook("open64",    (void *)my_open64,         (void **)&orig_open64);
         hook("openat",    (void *)my_openat,         (void **)&orig_openat);
@@ -809,11 +868,64 @@ static int register_against_all_libs(zygisk::Api *api, bool guard) {
         hook("selinux_check_access",
              (void *)my_selinux_check_access,
              (void **)&orig_selinux_check_access);
-        }
         ++n;
     }
     fclose(fp);
+    if (calls >= MAX_HOOK_CALLS) LOGW("register: hook budget reached (%d calls)", calls);
     return n;
+}
+
+// A pltHookRegister() that did not find the symbol leaves the "old" pointer
+// untouched.  Some providers also commit asynchronously, so re-resolve any
+// still-null slot from the global scope: a wrapper that hands back ENOSYS for
+// read()/openat() would break every app instead of staying transparent.
+struct SymSlot { const char *name; void **slot; };
+
+static void fill_missing_orig() {
+    static SymSlot slots[] = {
+        {"open",                       (void **)&orig_open},
+        {"open64",                     (void **)&orig_open64},
+        {"openat",                     (void **)&orig_openat},
+        {"openat64",                   (void **)&orig_openat64},
+        {"write",                      (void **)&orig_write},
+        {"read",                       (void **)&orig_read},
+        {"pread64",                    (void **)&orig_pread64},
+        {"close",                      (void **)&orig_close},
+        {"mmap",                       (void **)&orig_mmap},
+        {"mmap64",                     (void **)&orig_mmap64},
+        {"fopen",                      (void **)&stealth::orig_fopen},
+        {"fopen64",                    (void **)&stealth::orig_fopen64},
+        {"readlink",                   (void **)&stealth::orig_readlink},
+        {"readlinkat",                 (void **)&stealth::orig_readlinkat},
+        {"getenv",                     (void **)&stealth::orig_getenv},
+        {"secure_getenv",              (void **)&stealth::orig_secure_getenv},
+        {"dl_iterate_phdr",            (void **)&stealth::orig_dl_iterate_phdr},
+        {"prctl",                      (void **)&stealth::orig_prctl},
+        {"syscall",                    (void **)&stealth::orig_syscall},
+        {"stat",                       (void **)&stealth::orig_stat},
+        {"lstat",                      (void **)&stealth::orig_lstat},
+        {"fstat",                      (void **)&stealth::orig_fstat},
+        {"fstatat",                    (void **)&stealth::orig_fstatat},
+        {"statx",                      (void **)&stealth::orig_statx},
+#ifdef DSB_HAVE_STAT64
+        {"stat64",                     (void **)&stealth::orig_stat64},
+        {"lstat64",                    (void **)&stealth::orig_lstat64},
+        {"fstat64",                    (void **)&stealth::orig_fstat64},
+        {"fstatat64",                  (void **)&stealth::orig_fstatat64},
+#endif
+        {"__android_log_write",        (void **)&avc::orig_log_write},
+        {"__android_log_buf_write",    (void **)&avc::orig_log_buf_write},
+        {"__android_log_print",        (void **)&avc::orig_log_print},
+        {"__android_log_vprint",       (void **)&avc::orig_log_vprint},
+        {"security_compute_av",        (void **)&orig_security_compute_av},
+        {"security_compute_av_flags",  (void **)&orig_security_compute_av_flags},
+        {"selinux_check_access",       (void **)&orig_selinux_check_access},
+        {nullptr, nullptr},
+    };
+    for (int i = 0; slots[i].name; ++i) {
+        if (*slots[i].slot) continue;
+        *slots[i].slot = dlsym(RTLD_DEFAULT, slots[i].name);
+    }
 }
 
 // ---- Zygisk module ------------------------------------------------------
@@ -823,28 +935,40 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
+        // One line per boot.  If zygote dies without it, the failure is in the
+        // Zygisk provider's loader rather than in our callbacks.
+        LOGI("module loaded into pid %d", getpid());
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        if (!args) return;
         // Only ordinary, non-root apps get the scrubbed view.  Root-granted
         // apps keep the real /data/adb mappings and linker solist, so root
         // tooling keeps working.
-        bool ordinary = args && args->uid >= 10000 &&
+        bool ordinary = args->uid >= 10000 &&
                         !(api->getFlags() & zygisk::PROCESS_GRANTED_ROOT);
         // Leave debuggable apps alone: native/JDWP debuggers need ptrace.
-        bool debuggable = args && (args->runtime_flags & 0x1);
+        bool debuggable = (args->runtime_flags & 0x1) != 0;
         proc_guard = ordinary && !debuggable;
         install("app", ordinary);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
         // Must run after SpecializeCommon: its setresuid / PR_SET_DUMPABLE
-        // calls would overwrite a flag cleared in preAppSpecialize.
-        if (proc_guard && stealth::guard_process()) install_guard_hooks();
+        // calls would overwrite a flag cleared in preAppSpecialize.  The spoof
+        // hooks are already in place; they start rewriting only once
+        // guard_process() reports that it really changed the flag.
+        if (proc_guard && stealth::guard_process())
+            LOGI("cleared PR_SET_DUMPABLE for pid %d", getpid());
     }
 
-    void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {
-        install("server", false);
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+        // App zygotes (uid >= 10000) host DirtySepolicy's probes, so they get
+        // the hooks.  system_server (uid 1000) is deliberately left untouched:
+        // it maps the largest library set and a single bad hook there takes
+        // down system_server, which in turn kills zygote and the whole boot.
+        if (!args || args->uid < 10000) return;
+        install("app-zygote", true);
     }
 
 private:
@@ -856,30 +980,22 @@ private:
         stealth::set_app_mode(app_process);
         detect_kernel_version();
         resolve_hidden_bits();
-        int n = register_against_all_libs(api, false);
+        // Base hooks and (when needed) the dumpable spoof go into one batch: a
+        // second pltHookCommit() is not portable across Zygisk providers.
+        int n = register_against_all_libs(api, proc_guard);
+        bool committed = api->pltHookCommit();
+        // pltHookRegister() leaves "old" untouched when it cannot resolve a
+        // symbol; a wrapper that hands back ENOSYS for read()/openat() would
+        // break every app, so fill the gaps from the global scope.
+        fill_missing_orig();
         if (n == 0) {
             LOGW("[%s] no .so libs found to hook", who);
             return;
         }
-        if (!api->pltHookCommit()) {
-            LOGW("[%s] pltHookCommit failed after registering %d libs",
-                 who, n);
+        if (!committed) {
+            LOGW("[%s] pltHookCommit failed after registering %d libs", who, n);
         } else {
             LOGI("[%s] hooks committed across %d libs", who, n);
-        }
-    }
-
-    // Registers the dumpable-spoof hooks only in the process that actually
-    // needed guard_process().  Every other app and system_server keeps the
-    // plain hook set, so a bug here cannot take the Zygisk provider down for
-    // everyone.
-    void install_guard_hooks() {
-        int n = register_against_all_libs(api, true);
-        if (n == 0) return;
-        if (!api->pltHookCommit()) {
-            LOGW("guard hooks commit failed after %d libs", n);
-        } else {
-            LOGI("guard hooks committed across %d libs", n);
         }
     }
 };

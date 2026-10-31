@@ -408,9 +408,10 @@ def main():
     print("  getenv/secure_getenv         -> MAGISK*/ZYGISK*/KSU*/... return NULL")
     print("  path match                   -> /data/adb dirs, or module names in")
     print("                                  the final path component / [annotation]")
-    print("  ⚠ prctl/syscall/stat/statx spoof hooks are installed lazily and")
-    print("    only in a process whose dumpable flag was actually cleared;")
-    print("    ordinary apps and system_server never carry them")
+    print("  ⚠ prctl/syscall/stat/statx spoof hooks ride in the same single")
+    print("    pltHookCommit() batch, only in ordinary apps, and forward")
+    print("    untouched unless the dumpable flag was actually changed;")
+    print("    system_server is not instrumented at all")
     print("  stat/statx family (own /proc/<pid>) -> st_uid/st_gid stx_uid/stx_gid")
     print("                                  kept stock (profileable only)")
 
