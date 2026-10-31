@@ -53,12 +53,11 @@
 #define LOGD(...) ((void)0)
 #endif
 
-void *operator new   (size_t s)              { return malloc(s); }
-void *operator new[] (size_t s)              { return malloc(s); }
-void  operator delete   (void *p) noexcept   { free(p); }
-void  operator delete[] (void *p) noexcept   { free(p); }
-void  operator delete   (void *p, size_t) noexcept { free(p); }
-void  operator delete[] (void *p, size_t) noexcept { free(p); }
+// No C++ runtime is linked (APP_STL := none): the module uses no exceptions,
+// RTTI, STL containers or heap allocation of its own, and linking libc++ into
+// a library that gets dlopen()ed inside zygote/system_server would export
+// _Znwm/__cxa_throw/__gxx_personality_v0 and risk interposing on the host
+// process's runtime.
 
 // ---- hidden context substrings ------------------------------------------
 
