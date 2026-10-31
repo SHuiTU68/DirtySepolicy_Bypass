@@ -69,7 +69,9 @@ inline const char *const kSuspiciousActors[] = {
 };
 
 // Paths and loader keywords that give a root framework away when they show
-// up in maps, smaps, fd targets or linker namespaces.
+// up in maps, smaps, fd targets or linker namespaces.  Only applied while
+// serving the scrubbed view of an ordinary, non-root app process; root-granted
+// apps and system_server keep the real /data/adb mappings.
 inline bool restricted_path(const char *p) {
     if (!p || !*p) return false;
     static const char *const kTokens[] = {

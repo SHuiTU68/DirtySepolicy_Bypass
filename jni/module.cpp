@@ -763,8 +763,13 @@ public:
         this->env = env;
     }
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs *) override {
-        install("app", true);
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // Only ordinary, non-root apps get the scrubbed view.  Root-granted
+        // apps keep the real /data/adb mappings and linker solist, so root
+        // tooling keeps working.
+        bool ordinary = args && args->uid >= 10000 &&
+                        !(api->getFlags() & zygisk::PROCESS_GRANTED_ROOT);
+        install("app", ordinary);
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *) override {

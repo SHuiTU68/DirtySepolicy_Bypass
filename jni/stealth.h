@@ -25,7 +25,9 @@ extern char    *(*orig_getenv)(const char *);
 extern char    *(*orig_secure_getenv)(const char *);
 extern int      (*orig_dl_iterate_phdr)(int (*)(struct dl_phdr_info *, size_t, void *), void *);
 
-// True for processes that must behave exactly like a normal app.
+// Enables the scrubbed view.  Set only for ordinary, non-root app processes
+// (uid >= 10000 and without PROCESS_GRANTED_ROOT); root-granted apps and
+// system_server keep the real /data/adb mappings and linker solist.
 void set_app_mode(bool app);
 
 // Returns an anonymous memfd holding a scrubbed copy of `path`, or -1 when

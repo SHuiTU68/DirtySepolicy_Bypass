@@ -105,6 +105,11 @@ every app and system_server process.
 - `readlink`/`readlinkat` return `ENOENT` for module or deleted-`.so` targets.
 - `getenv`/`secure_getenv` hide `TMP_PATH`, `MAGISK*`, `ZYGISK*`, `KSU*`, …
 
+Scrubbing is enabled **only for ordinary, non-root app processes** (uid ≥
+10000 and without `PROCESS_GRANTED_ROOT`). Root-granted apps and
+`system_server` keep the real `/data/adb` mappings, fd targets and linker
+solist, so root tooling and the shell are unaffected.
+
 `jni/avc.cpp` is a ZygiskNext-free port of [ZN-AuditPatch](https://github.com/aviraxp/ZN-AuditPatch):
 instead of injecting `logd` it drops leaking AVC records from
 `__android_log_*` and from `read()` buffers, so `logcat -b events` no longer

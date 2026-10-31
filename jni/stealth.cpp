@@ -344,22 +344,26 @@ static ssize_t filter_link(ssize_t ret, char *buf, size_t bufsiz) {
 
 ssize_t my_readlink(const char *path, char *buf, size_t bufsiz) {
     if (!orig_readlink) { errno = ENOSYS; return -1; }
-    return filter_link(orig_readlink(path, buf, bufsiz), buf, bufsiz);
+    ssize_t ret = orig_readlink(path, buf, bufsiz);
+    if (!g_app_mode) return ret;
+    return filter_link(ret, buf, bufsiz);
 }
 
 ssize_t my_readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
     if (!orig_readlinkat) { errno = ENOSYS; return -1; }
-    return filter_link(orig_readlinkat(dirfd, path, buf, bufsiz), buf, bufsiz);
+    ssize_t ret = orig_readlinkat(dirfd, path, buf, bufsiz);
+    if (!g_app_mode) return ret;
+    return filter_link(ret, buf, bufsiz);
 }
 
 char *my_getenv(const char *name) {
-    if (hidden_env_name(name)) return nullptr;
+    if (g_app_mode && hidden_env_name(name)) return nullptr;
     if (!orig_getenv) return nullptr;
     return orig_getenv(name);
 }
 
 char *my_secure_getenv(const char *name) {
-    if (hidden_env_name(name)) return nullptr;
+    if (g_app_mode && hidden_env_name(name)) return nullptr;
     if (orig_secure_getenv) return orig_secure_getenv(name);
     if (orig_getenv) return orig_getenv(name);
     return nullptr;
@@ -372,13 +376,15 @@ struct PhdrCtx {
 
 static int phdr_filter(struct dl_phdr_info *info, size_t size, void *data) {
     auto *ctx = static_cast<PhdrCtx *>(data);
-    if (info && info->dlpi_name && dsb::restricted_path(info->dlpi_name))
+    if (g_app_mode && info && info->dlpi_name &&
+        dsb::restricted_path(info->dlpi_name))
         return 0;
     return ctx->cb(info, size, ctx->data);
 }
 
 int my_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
     if (!orig_dl_iterate_phdr) return -1;
+    if (!g_app_mode) return orig_dl_iterate_phdr(cb, data);
     PhdrCtx ctx = {cb, data};
     return orig_dl_iterate_phdr(phdr_filter, &ctx);
 }
