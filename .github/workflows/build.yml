@@ -16,13 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Install NDK
+      - name: Ensure Android NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install "ndk;26.1.10909125"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "${ANDROID_NDK_HOME:-}" ]; then
+            NDK_DIR="$(ls -d "$SDK"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [ -n "$NDK_DIR" ]; then
+              echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+            else
+              yes | sdkmanager --licenses >/dev/null 2>&1 || true
+              sdkmanager --install "ndk;26.1.10909125"
+              echo "ANDROID_NDK_HOME=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
+            fi
+          fi
+          echo "Using NDK: ${ANDROID_NDK_HOME:-$SDK/ndk}"
 
       - name: Build all ABIs and package zip
         run: |
