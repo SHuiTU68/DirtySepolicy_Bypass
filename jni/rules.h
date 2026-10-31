@@ -63,8 +63,9 @@ inline const char *const kBinaryTokens[] = {
 };
 
 inline const char *const kSuspiciousActors[] = {
-    "su", "magisk", "magiskd", "ksud", "kernelsu", "apatch", "apd",
-    "supersu", "supolicy", "shamiko", "zygisk", "dirtysepbypass",
+    "su", "magisk", "magiskd", "magisk32", "ksud", "kernelsu", "apatch",
+    "apd", "supersu", "supolicy", "shamiko", "zygisk", "zygiskd",
+    "zygisk64", "zygisk32", "dirtysepbypass", "auditpatch",
     nullptr,
 };
 
@@ -72,17 +73,34 @@ inline const char *const kSuspiciousActors[] = {
 // up in maps, smaps, fd targets or linker namespaces.  Only applied while
 // serving the scrubbed view of an ordinary, non-root app process; root-granted
 // apps and system_server keep the real /data/adb mappings.
+//
+// Directory prefixes are matched anywhere in the string, but framework names
+// are matched only against the final path component or a [bracket] mapping
+// annotation.  Otherwise an app whose own data path merely contains e.g.
+// "magisk" (com.topjohnwu.magisk) or "lsposed" would have its own APK
+// mappings scrubbed away, which is a stronger anomaly than the injection.
 inline bool restricted_path(const char *p) {
     if (!p || !*p) return false;
-    static const char *const kTokens[] = {
-        "/data/adb", "/debug_ramdisk", "/sbin/.magisk",
-        "zygisk", "magisk", "riru", "lsposed", "xposed", "kernelsu",
-        "ksud", "apatch", "shamiko", "auditpatch",
-        "neozygisk", "rezygisk", "dirtysepbypass",
+    static const char *const kDirs[] = {
+        "/data/adb", "/debug_ramdisk", "/sbin/.magisk", "/sbin/magisk",
         nullptr,
     };
+    for (int i = 0; kDirs[i]; ++i) {
+        if (strstr(p, kDirs[i])) return true;
+    }
+
+    static const char *const kTokens[] = {
+        "zygisk", "magisk", "riru", "lsposed", "xposed", "kernelsu",
+        "ksud", "apatch", "shamiko", "auditpatch", "neozygisk",
+        "rezygisk", "dirtysepbypass", "supersu", "supolicy", "kitsune",
+        nullptr,
+    };
+    const char *base = strrchr(p, '/');
+    base = base ? base + 1 : p;
+    const char *ann = strrchr(p, '[');
     for (int i = 0; kTokens[i]; ++i) {
-        if (strstr(p, kTokens[i])) return true;
+        if (strstr(base, kTokens[i])) return true;
+        if (ann && strstr(ann, kTokens[i])) return true;
     }
     return false;
 }

@@ -1,11 +1,12 @@
 // Userspace zygisk-injection hiding.
 //
 // Detectors such as Duck-Detector enumerate linker solists, /proc/self/maps,
-// /proc/self/smaps, /proc/self/status, fd targets and thread comm values to
-// find a framework loaded into an otherwise clean app process.  This component
-// serves scrubbed, private copies of those files (anonymous memfd), filters
-// dl_iterate_phdr and readlink results, and hides framework environment
-// variables.
+// /proc/self/smaps, /proc/self/smaps_rollup, /proc/self/status, stat/sched,
+// mountinfo, environ, fd targets and thread comm values to find a framework
+// loaded into an otherwise clean app process.  This component serves scrubbed,
+// private copies of those files (anonymous memfd), filters dl_iterate_phdr and
+// readlink results, and hides framework environment variables.  Paths are also
+// recognised when written as /proc/<own-pid>/... or /proc/thread-self/...
 
 #pragma once
 

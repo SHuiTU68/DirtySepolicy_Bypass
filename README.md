@@ -43,14 +43,14 @@ Duck-Detector adds:
 
 | Hook | Target | Effect |
 |---|---|---|
-| `open`/`openat` | selinuxfs `access`, `context`, `status`, `policy`, `avc/cache_stats` | Track and classify fds |
+| `open`/`open64`/`openat`/`openat64` | selinuxfs `access`, `context`, `status`, `policy`, `avc/cache_stats` | Track and classify fds |
 | `write` | `access`, `context`, `/proc/*/attr/*` | Block hidden-context writes, stash access queries |
-| `read`/`pread64` | `access` | Mask hidden permission bits, exact probes, force `seqno=1` |
+| `read`/`pread64` | `access` | Mask hidden permission bits, exact probes, force `decided=0xffffffff` and `seqno=1` |
 | `read` | `status` | Rewrite `sequence` / `policyload` for the kernel baseline |
 | `read`/`pread64` | `policy` | Erase framework strings from the binary policy blob |
 | `read`/`pread64` | `avc/cache_stats` | Zero lookup/hit/miss counters |
 | `mmap`/`mmap64` | `status` | Return `EACCES` (blocks the mmap-ABI probe) |
-| `open`/`openat`/`fopen`/`fopen64` | `/proc/self/{maps,smaps,status,comm}`, `task/*/comm` | Serve a scrubbed anonymous memfd copy |
+| `open`/`open64`/`openat`/`openat64`/`fopen`/`fopen64` | `/proc/{self,thread-self,<own-pid>}/{maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,mountstats,environ}`, `task/<tid>/*` | Serve a scrubbed anonymous memfd copy |
 | `readlink`/`readlinkat` | `/proc/self/fd/*` | `ENOENT` for module/deleted `.so` targets |
 | `dl_iterate_phdr` | linker solist | Hide module entries |
 | `getenv`/`secure_getenv` | `TMP_PATH`, `MAGISK*`, `ZYGISK*`, … | Return `NULL` |
@@ -96,14 +96,21 @@ every app and system_server process.
 
 `jni/stealth.cpp` makes the injected library invisible to a normal app:
 
-- `/proc/self/maps`, `/proc/self/smaps`, `/proc/self/status`,
-  `/proc/self/comm` and `task/*/comm` are served from an anonymous
-  `memfd:jit-cache` copy with module paths removed, `TracerPid` zeroed and
-  suspicious thread names rewritten.
+- `/proc/{self,thread-self,<own-pid>}/maps`, `smaps`, `smaps_rollup`,
+  `status`, `comm`, `task/<tid>/maps`, `stat`, `sched`, `mountinfo`, `mounts`,
+  `mountstats` and `environ` are served from an anonymous `memfd:jit-cache`
+  copy. Module paths are removed, `TracerPid` is zeroed and thread names that
+  expose a framework (`su`, `magiskd`, `zygisk…`) are rewritten to
+  `zygote64`. `environ` is NUL-separated and filtered entry by entry.
+- The literal pid and `/proc/thread-self` are recognised as aliases of
+  `/proc/self`, so `open("/proc/<getpid()>/maps")` gets the same scrubbed copy.
 - `dl_iterate_phdr` entries pointing at `/data/adb`, `magisk`, `zygisk`,
   `lsposed`, … are skipped.
 - `readlink`/`readlinkat` return `ENOENT` for module or deleted-`.so` targets.
 - `getenv`/`secure_getenv` hide `TMP_PATH`, `MAGISK*`, `ZYGISK*`, `KSU*`, …
+- Framework names are matched only in the final path component or a
+  `[bracket]` mapping annotation, so an app whose own package path contains
+  `magisk`/`lsposed` is not scrubbed out of its own maps.
 
 Scrubbing is enabled **only for ordinary, non-root app processes** (uid ≥
 10000 and without `PROCESS_GRANTED_ROOT`). Root-granted apps and
@@ -127,7 +134,7 @@ Two supported paths:
 # Local build (Android NDK r26+ and python3):
 export ANDROID_NDK_HOME=/path/to/ndk
 ./tools/build.sh
-# -> dist/dirtysepbypass-v4.0.0.zip
+# -> dist/dirtysepbypass-v4.1.0.zip
 ```
 
 `tools/build.sh` runs `ndk-build` for arm64-v8a, armeabi-v7a, x86 and x86_64,
@@ -222,6 +229,16 @@ Rebuild, reflash, reboot, re-audit.
 - **memfd artifact.** Scrubbed files are served from `memfd:jit-cache`
   (a name ART also uses); the fd target remains visible as an anonymous
   inode by design.
+- **Cross-process `/proc` reads.** Hooks live inside the app process. A
+  detector that forks a helper (`Runtime.exec("cat /proc/<app-pid>/maps")`)
+  reads the untouched file from a process we were never injected into. Only a
+  kernel-side solution (KernelSU's `kernel_umount`/LSM work) closes this.
+- **Raw syscalls and memory scans.** Code that issues `syscall()` inline
+  instead of through libc's PLT, or scans its own heap/ELF for module strings,
+  bypasses these userspace hooks.
+- **Path heuristic.** Framework names are matched in the final path component
+  or `[annotation]`; a mapping whose basename is deliberately innocuous is not
+  caught.
 
 ## Compatibility
 

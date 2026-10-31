@@ -395,6 +395,20 @@ def main():
     fake = "u:r:priv_app:s0:c512,c768"
     print(f"  fake tcontext {fake!r} -> never synthesized")
 
+    print()
+    print("Zygisk injection surfaces (ordinary, non-root apps only):")
+    print("-" * 72)
+    print("  /proc/{self,thread-self,<own-pid>}/maps,smaps smaps_rollup")
+    print("    status,comm,stat,sched,mountinfo,mounts,mountstats")
+    print("    environ                     -> scrubbed anonymous memfd")
+    print("  open/open64/openat/openat64/fopen/fopen64")
+    print("                                -> routed to the scrubbed copy")
+    print("  dl_iterate_phdr              -> framework entries skipped")
+    print("  readlink/readlinkat          -> ENOENT for /data/adb & module .so")
+    print("  getenv/secure_getenv         -> MAGISK*/ZYGISK*/KSU*/... return NULL")
+    print("  path match                   -> /data/adb dirs, or module names in")
+    print("                                  the final path component / [annotation]")
+
     # --- summary ---
     print()
     print("=" * 72)

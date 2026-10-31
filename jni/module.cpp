@@ -9,9 +9,10 @@
 //    policy reloads (sequence/policyload counters) and blocking mmap of it.
 // 4. PLT-hooking libselinux APIs as defense-in-depth against detectors that
 //    still use the userspace library.
-// 5. Handing out scrubbed copies of /proc/self/{maps,smaps,status,comm}, fd
-//    link targets, linker solists and environment variables so a normal app
-//    cannot see the injected library (see stealth.cpp).
+// 5. Handing out scrubbed copies of /proc/{self,thread-self,<pid>}/{
+//    maps,smaps,smaps_rollup,status,comm,stat,sched,mountinfo,mounts,environ},
+//    fd link targets, linker solists and environment variables so a normal app
+//    cannot see the injected Zygisk library (see stealth.cpp).
 // 6. Dropping leaking AVC audit records at the log source and while reading
 //    logcat-style streams (see avc.cpp, ported from ZN-AuditPatch without the
 //    ZygiskNext dependency).
@@ -341,12 +342,20 @@ static ssize_t patch_access_response(TrackedFd *tfd, char *buf,
         }
     }
 
-    unsigned int orig_seqno = seqno;
+    // Match the kernel's userspace ABI exactly: selinuxfs always reports
+    // 0xffffffff in the "decided" slot and seqno 1 on a clean boot.  KernelSU
+    // does the same when it re-computes /access against the pre-injection
+    // policy (see kernel/feature/selinux_hide.c, my_write_access).
+    unsigned int orig_seqno = seqno, orig_decided = decided;
+    decided = 0xffffffffu;
     seqno = 1;
 
-    if (allowed != orig_allowed || auditallow != orig_auditallow || orig_seqno != 1)
-        LOGD("patch_access: scon=%s tcon=%s class=%u allowed=0x%x->0x%x auditallow=0x%x->0x%x seqno=%u->1",
-             tfd->scon, tfd->tcon, tfd->tclass, orig_allowed, allowed, orig_auditallow, auditallow, orig_seqno);
+    if (allowed != orig_allowed || auditallow != orig_auditallow ||
+        orig_seqno != 1 || orig_decided != decided)
+        LOGD("patch_access: scon=%s tcon=%s class=%u allowed=0x%x->0x%x auditallow=0x%x->0x%x "
+             "decided=0x%x->0x%x seqno=%u->1",
+             tfd->scon, tfd->tcon, tfd->tclass, orig_allowed, allowed,
+             orig_auditallow, auditallow, orig_decided, decided, orig_seqno);
 
     int newlen = snprintf(buf, bufsize, "%x %x %x %x %u %x",
                           allowed, decided, auditallow, auditdeny, seqno, flags);
@@ -520,7 +529,9 @@ static int my_selinux_check_access(const char *scon, const char *tcon,
 // ---- file I/O hooks -----------------------------------------------------
 
 static int     (*orig_open)(const char *, int, ...) = nullptr;
+static int     (*orig_open64)(const char *, int, ...) = nullptr;
 static int     (*orig_openat)(int, const char *, int, ...) = nullptr;
+static int     (*orig_openat64)(int, const char *, int, ...) = nullptr;
 static ssize_t (*orig_write)(int, const void *, size_t) = nullptr;
 static ssize_t (*orig_read)(int, void *, size_t) = nullptr;
 static ssize_t (*orig_pread64)(int, void *, size_t, off64_t) = nullptr;
@@ -541,18 +552,33 @@ static const char *fdtype_str(FdType t) {
 }
 #endif
 
+static void track_if_needed(int fd, const char *pathname) {
+    if (fd < 0) return;
+    FdType type = classify_path(pathname);
+    if (type != FD_NONE) {
+        track_fd(fd, type);
+        LOGD("open: tracking fd=%d type=%s path=%s", fd, fdtype_str(type), pathname);
+    }
+}
+
 static int my_open(const char *pathname, int flags, mode_t mode) {
     int virtual_fd = stealth::open_virtual(pathname);
     if (virtual_fd >= 0) return virtual_fd;
 
     int fd = orig_open ? orig_open(pathname, flags, mode) : -1;
-    if (fd >= 0) {
-        FdType type = classify_path(pathname);
-        if (type != FD_NONE) {
-            track_fd(fd, type);
-            LOGD("open: tracking fd=%d type=%s path=%s", fd, fdtype_str(type), pathname);
-        }
-    }
+    track_if_needed(fd, pathname);
+    return fd;
+}
+
+static int my_open64(const char *pathname, int flags, mode_t mode) {
+    int virtual_fd = stealth::open_virtual(pathname);
+    if (virtual_fd >= 0) return virtual_fd;
+
+    int fd;
+    if (orig_open64)             fd = orig_open64(pathname, flags, mode);
+    else if (orig_open)          fd = orig_open(pathname, flags, mode);
+    else                         fd = -1;
+    track_if_needed(fd, pathname);
     return fd;
 }
 
@@ -561,13 +587,19 @@ static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
     if (virtual_fd >= 0) return virtual_fd;
 
     int fd = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
-    if (fd >= 0) {
-        FdType type = classify_path(pathname);
-        if (type != FD_NONE) {
-            track_fd(fd, type);
-            LOGD("openat: tracking fd=%d type=%s path=%s", fd, fdtype_str(type), pathname);
-        }
-    }
+    track_if_needed(fd, pathname);
+    return fd;
+}
+
+static int my_openat64(int dirfd, const char *pathname, int flags, mode_t mode) {
+    int virtual_fd = stealth::open_virtual(pathname);
+    if (virtual_fd >= 0) return virtual_fd;
+
+    int fd;
+    if (orig_openat64)           fd = orig_openat64(dirfd, pathname, flags, mode);
+    else if (orig_openat)        fd = orig_openat(dirfd, pathname, flags, mode);
+    else                         fd = -1;
+    track_if_needed(fd, pathname);
     return fd;
 }
 
@@ -717,7 +749,9 @@ static int register_against_all_libs(zygisk::Api *api) {
         };
 
         hook("open",      (void *)my_open,           (void **)&orig_open);
+        hook("open64",    (void *)my_open64,         (void **)&orig_open64);
         hook("openat",    (void *)my_openat,         (void **)&orig_openat);
+        hook("openat64",  (void *)my_openat64,       (void **)&orig_openat64);
         hook("write",     (void *)my_write,          (void **)&orig_write);
         hook("read",      (void *)my_read,           (void **)&orig_read);
         hook("pread64",   (void *)my_pread64,        (void **)&orig_pread64);

@@ -107,6 +107,13 @@ static char *read_whole(const char *path, size_t *out_len, size_t max_size) {
         len += static_cast<size_t>(n);
     }
     raw_close(fd);
+
+    // Keep a little head room so a scrubber may grow a few bytes (thread
+    // name replacement in stat/sched).
+    if (len && cap < len + 64) {
+        char *nb = static_cast<char *>(realloc(buf, len + 64));
+        if (nb) buf = nb;
+    }
     *out_len = len;
     return buf;
 }
@@ -139,18 +146,65 @@ static bool is_cache_stats(const char *p) {
     return p && strstr(p, "/avc/cache_stats") != nullptr;
 }
 
-static bool is_self_proc_file(const char *p) {
-    if (!p) return false;
-    if (strncmp(p, "/proc/self/", 11) != 0) return false;
-    const char *rest = p + 11;
-    if (strcmp(rest, "maps") == 0 || strcmp(rest, "smaps") == 0 ||
-        strcmp(rest, "status") == 0 || strcmp(rest, "comm") == 0)
-        return true;
-    if (strncmp(rest, "task/", 5) == 0) {
-        const char *tail = strstr(rest, "/comm");
-        if (tail && strcmp(tail, "/comm") == 0) return true;
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+// Accepts /proc/self/..., /proc/thread-self/... and /proc/<own-pid>/...
+// (including /proc/<pid>/task/<tid>/...).  Detectors routinely substitute the
+// literal pid for "self" to dodge naive string matching, and /proc/thread-self
+// is another alias.  Returns the leaf name, or nullptr when the path is not
+// this process.
+static const char *proc_self_suffix(const char *p) {
+    if (!p) return nullptr;
+    const char *rest = nullptr;
+
+    if (strncmp(p, "/proc/self/", 11) == 0) {
+        rest = p + 11;
+    } else if (strncmp(p, "/proc/thread-self/", 18) == 0) {
+        rest = p + 18;
+    } else if (strncmp(p, "/proc/", 6) == 0) {
+        const char *q = p + 6;
+        const char *digits = q;
+        long pid = 0;
+        while (is_digit(*q)) { pid = pid * 10 + (*q - '0'); ++q; }
+        if (q == digits || *q != '/') return nullptr;
+        if (pid != static_cast<long>(getpid())) return nullptr;
+        rest = q + 1;
+    } else {
+        return nullptr;
     }
-    return false;
+
+    if (strncmp(rest, "task/", 5) == 0) {
+        const char *slash = strchr(rest + 5, '/');
+        if (!slash) return nullptr;
+        rest = slash + 1;
+    }
+    return rest;
+}
+
+enum VirtualKind {
+    VK_NONE = 0,
+    VK_TEXT,   // line-oriented: maps, status, mountinfo, ...
+    VK_ENV,    // NUL-separated environ
+    VK_STAT,   // one-line pid (comm) ... / sched
+    VK_AVC,    // avc/cache_stats counters
+};
+
+static VirtualKind classify_virtual(const char *p) {
+    if (!p) return VK_NONE;
+    if (is_cache_stats(p)) return VK_AVC;
+
+    const char *leaf = proc_self_suffix(p);
+    if (!leaf || !*leaf) return VK_NONE;
+
+    if (strcmp(leaf, "environ") == 0) return VK_ENV;
+    if (strcmp(leaf, "stat") == 0 || strcmp(leaf, "sched") == 0)
+        return VK_STAT;
+    if (strcmp(leaf, "maps") == 0 || strcmp(leaf, "smaps") == 0 ||
+        strcmp(leaf, "smaps_rollup") == 0 || strcmp(leaf, "status") == 0 ||
+        strcmp(leaf, "comm") == 0 || strcmp(leaf, "mountinfo") == 0 ||
+        strcmp(leaf, "mounts") == 0 || strcmp(leaf, "mountstats") == 0)
+        return VK_TEXT;
+    return VK_NONE;
 }
 
 // ---- text scrubbing ------------------------------------------------------
@@ -162,10 +216,18 @@ static bool hidden_env_name(const char *name) {
         "lsposed", "xposed", "riru", "shamiko", "supolicy", "adbroot",
         nullptr,
     };
+    static const char *const kPrefixes[] = {
+        "magisk_", "zygisk_", "ksu_", "kernelsu_", "apatch_", "lsposed_",
+        "xposed_", "riru_", "shamiko_", "supolicy_", "adbroot_",
+        nullptr,
+    };
     char lower[64];
     dsb::lower_copy(lower, name, sizeof(lower));
     for (int i = 0; kNames[i]; ++i)
         if (strcmp(lower, kNames[i]) == 0) return true;
+    for (int i = 0; kPrefixes[i]; ++i)
+        if (strncmp(lower, kPrefixes[i], strlen(kPrefixes[i])) == 0)
+            return true;
     return false;
 }
 
@@ -246,6 +308,106 @@ size_t scrub_text(char *buf, size_t len) {
     return out;
 }
 
+// /proc/self/environ is NUL-separated, not newline-separated.
+size_t scrub_environ(char *buf, size_t len) {
+    if (!buf || len == 0) return 0;
+
+    size_t out = 0, i = 0;
+    while (i < len) {
+        size_t j = i;
+        while (j < len && buf[j] != '\0') ++j;
+        size_t entry_len = j - i;
+
+        if (entry_len == 0) {  // separator / trailing NUL
+            i = j + 1;
+            continue;
+        }
+
+        bool drop = false;
+        size_t eq = 0;
+        while (eq < entry_len && buf[i + eq] != '=') ++eq;
+        if (eq < entry_len) {
+            char name[64];
+            size_t n = eq < sizeof(name) - 1 ? eq : sizeof(name) - 1;
+            memcpy(name, buf + i, n);
+            name[n] = '\0';
+            drop = hidden_env_name(name) ||
+                   line_is_restricted(buf + i + eq + 1, entry_len - eq - 1);
+        }
+
+        if (!drop) {
+            if (out != i) memmove(buf + out, buf + i, entry_len);
+            out += entry_len;
+            buf[out++] = '\0';
+        }
+        i = j + 1;
+    }
+
+    if (out == 0 && len > 0) { buf[0] = '\0'; out = 1; }
+    return out;
+}
+
+// /proc/[pid]/stat: "pid (comm) state ..."  /proc/[pid]/sched: "comm (tid, ...)"
+size_t scrub_stat(char *buf, size_t len) {
+    if (!buf || len == 0) return len;
+
+    const char *open_p = static_cast<const char *>(memchr(buf, '(', len));
+    if (!open_p) return len;
+    size_t start = static_cast<size_t>(open_p - buf) + 1;
+
+    // stat is "pid (comm) ...", sched is "comm (tid, ...)".  If the text
+    // before '(' is not a pid, the comm lives there instead.
+    size_t pre = start - 1;
+    while (pre > 0 && (buf[pre - 1] == ' ' || buf[pre - 1] == '\t')) --pre;
+    bool pid_prefix = true;
+    for (size_t k = 0; k < pre; ++k) {
+        if (!is_digit(buf[k])) { pid_prefix = false; break; }
+    }
+    if (!pid_prefix) {
+        char scomm[64];
+        size_t cn = pre < sizeof(scomm) - 1 ? pre : sizeof(scomm) - 1;
+        memcpy(scomm, buf, cn);
+        scomm[cn] = '\0';
+        if (!line_is_hidden_comm(scomm, cn)) return len;
+
+        static const char kNew0[] = "zygote64";
+        const size_t nlen0 = sizeof(kNew0) - 1;
+        const size_t tail0 = len - pre;
+        const size_t outlen0 = nlen0 + tail0;
+        if (outlen0 > len + 64) return len;
+        memmove(buf + nlen0, buf + pre, tail0);
+        memcpy(buf, kNew0, nlen0);
+        return outlen0;
+    }
+
+    size_t limit = len;
+    const char *nl = static_cast<const char *>(memchr(buf, '\n', len));
+    if (nl) limit = static_cast<size_t>(nl - buf);
+
+    size_t end = start;
+    for (size_t k = limit; k > start; --k) {
+        if (buf[k - 1] == ')') { end = k - 1; break; }
+    }
+    if (end <= start) return len;
+
+    char comm[64];
+    size_t n = end - start;
+    if (n >= sizeof(comm)) n = sizeof(comm) - 1;
+    memcpy(comm, buf + start, n);
+    comm[n] = '\0';
+    if (!line_is_hidden_comm(comm, n)) return len;
+
+    static const char kNew[] = "zygote64";
+    const size_t newlen = sizeof(kNew) - 1;
+    const size_t tail = len - end;
+    const size_t outlen = start + newlen + tail;
+    if (outlen > len + 64) return len;  // no head room: leave untouched
+
+    if (newlen != n) memmove(buf + start + newlen, buf + end, tail);
+    memcpy(buf + start, kNew, newlen);
+    return outlen;
+}
+
 void scrub_avc_stats(char *buf, size_t len) {
     if (!buf || len == 0) return;
     size_t i = 0;
@@ -273,19 +435,29 @@ void scrub_policy(char *buf, size_t len) {
 
 int open_virtual(const char *path) {
     if (!g_app_mode || !path) return -1;
-    bool stats = is_cache_stats(path);
-    if (!stats && !is_self_proc_file(path)) return -1;
+    VirtualKind kind = classify_virtual(path);
+    if (kind == VK_NONE) return -1;
 
     size_t len = 0;
-    char *buf = read_whole(path, &len, 8u * 1024u * 1024u);
+    char *buf = read_whole(path, &len, 16u * 1024u * 1024u);
     if (!buf) return -1;
     if (len == 0) { free(buf); return -1; }
 
-    if (stats) {
-        scrub_avc_stats(buf, len);
-    } else {
-        len = scrub_text(buf, len);
-        if (len == 0) { free(buf); return -1; }
+    switch (kind) {
+        case VK_AVC:
+            scrub_avc_stats(buf, len);
+            break;
+        case VK_ENV:
+            len = scrub_environ(buf, len);
+            if (len == 0) { free(buf); return -1; }
+            break;
+        case VK_STAT:
+            len = scrub_stat(buf, len);
+            break;
+        default:
+            len = scrub_text(buf, len);
+            if (len == 0) { free(buf); return -1; }
+            break;
     }
 
     int fd = memfd_from("jit-cache", buf, len);
@@ -376,9 +548,14 @@ struct PhdrCtx {
 
 static int phdr_filter(struct dl_phdr_info *info, size_t size, void *data) {
     auto *ctx = static_cast<PhdrCtx *>(data);
-    if (g_app_mode && info && info->dlpi_name &&
-        dsb::restricted_path(info->dlpi_name))
-        return 0;
+    if (g_app_mode && info && info->dlpi_name) {
+        // Anonymous memfd modules are how ZygiskNext/Riru-style injectors
+        // avoid a /data/adb path; stock app processes have no such entries
+        // in their linker solist.
+        if (dsb::restricted_path(info->dlpi_name) ||
+            strstr(info->dlpi_name, "memfd:") != nullptr)
+            return 0;
+    }
     return ctx->cb(info, size, ctx->data);
 }
 

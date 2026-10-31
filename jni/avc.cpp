@@ -65,6 +65,17 @@ bool line_leaks(const char *s, size_t len) {
     if (!s || len == 0) return false;
     if (dsb::hidden_buffer(s, len)) return true;
     if (has_suspicious_comm(s, len)) return true;
+    // AVC records carry the offending path inside path=/name= fields, where
+    // the framework name has no ':' prefix (hidden_buffer would miss it).
+    if (dsb::mem_contains(s, len, "/data/adb")) return true;
+    static const char *const kPaths[] = {
+        "zygisk", "magisk", "kernelsu", "ksud", "shamiko", "lsposed",
+        "xposed", "riru", "apatch", "auditpatch", "dirtysepbypass",
+        nullptr,
+    };
+    for (int i = 0; kPaths[i]; ++i) {
+        if (dsb::mem_contains(s, len, kPaths[i])) return true;
+    }
     // ZN-AuditPatch forgery markers Duck-Detector matches directly.
     if (dsb::mem_contains(s, len, "zn-auditpatch")) return true;
     if (dsb::mem_contains(s, len, "libauditpatch")) return true;
@@ -110,6 +121,8 @@ size_t filter_buffer(void *buf, size_t len) {
 
 static bool text_self_exposes(const char *tag, const char *text, size_t len) {
     if (is_avc_record(text, len) && line_leaks(text, len)) return true;
+    // Only our own bookkeeping strings; do not swallow app logs that merely
+    // mention a framework name.
     if (dsb::mem_contains(text, len, "dirtysepbypass")) return true;
     if (dsb::mem_contains(text, len, "auditpatch")) return true;
     if (tag && (strstr(tag, "auditpatch") || strstr(tag, "DirtySep") ||

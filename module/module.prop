@@ -1,7 +1,7 @@
 id=dirtysepbypass
 name=DirtySepolicy Bypass
-version=v4.0.0
-versionCode=40000
+version=v4.1.0
+versionCode=41000
 author=local
-description=Defeats DirtySepolicy up to v2.2 and the Duck-Detector probe set. Intercepts selinuxfs access/status/context/policy and libselinux APIs, serves scrubbed /proc/self maps/smaps/status/comm, linker solists, fd links and env vars so ordinary apps cannot find the Zygisk injection, and drops leaking AVC audit records from __android_log_* and logcat streams (ZN-AuditPatch style, without ZygiskNext).
+description=Defeats DirtySepolicy up to v2.2 and the Duck-Detector probe set. Intercepts selinuxfs access/status/context/policy and libselinux APIs, serves scrubbed /proc/{self,thread-self,<pid>}/maps/smaps/smaps_rollup/status/comm/stat/sched/mountinfo/mounts/environ, linker solists, fd links and env vars so ordinary apps cannot find the Zygisk injection, and drops leaking AVC audit records from __android_log_* and logcat streams (ZN-AuditPatch style, without ZygiskNext).
 updateJson=
