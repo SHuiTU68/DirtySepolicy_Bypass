@@ -14,7 +14,7 @@ case "$ARCH" in
      abort  "! Aborting" ;;
 esac
 
-ui_print "- Installing DirtySepolicy Bypass v5.0.0 (kernel side)"
+ui_print "- Installing DirtySepolicy Bypass v5.0.1 (kernel side)"
 
 if [ ! -f "$MODPATH/kmod/dsb_kmod.ko" ]; then
   ui_print "! Missing kmod/dsb_kmod.ko in module zip"
@@ -23,8 +23,11 @@ fi
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/customize.sh"   0 0 0755
-set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
+set_perm "$MODPATH/service.sh"     0 0 0755
+set_perm "$MODPATH/uninstall.sh"   0 0 0755
 set_perm "$MODPATH/kmod/dsb_kmod.ko" 0 0 0644
 
-ui_print "- Reboot to load dsb_kmod.ko (post-fs-data)."
-ui_print "- Check /data/adb/modules/dirtysepbypass/load.log for the result."
+ui_print "- The kernel module loads after boot (service stage)."
+ui_print "- Check /data/adb/modules/dirtysepbypass/load.log after reboot."
+ui_print "- Mount-table hiding is opt-in: create an empty file"
+ui_print "  /data/adb/modules/dirtysepbypass/hide_mounts and reboot."

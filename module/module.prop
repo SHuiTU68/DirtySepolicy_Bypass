@@ -1,7 +1,7 @@
 id=dirtysepbypass
 name=DirtySepolicy Bypass
-version=v5.0.0
-versionCode=50000
+version=v5.0.1
+versionCode=50001
 author=SHuiTU68
-description=Kernel-side hiding (no Zygisk): a small kprobe LKM hides Magisk/LSPosed/KernelSU/APatch SELinux contexts, fakes selinuxfs access answers and drops root-managed mount lines for ordinary apps. Nothing is injected into app, zygote or app_zygote processes, so isolated probes are covered too. Requires an arm64 device whose kernel allows kretprobes and unsigned module loading (OnePlus MT6991 / 6.6 GKI).
+description=Kernel-side hiding (no Zygisk). A kprobe LKM hides Magisk/LSPosed/KernelSU/APatch SELinux contexts and fakes selinuxfs access answers for ordinary apps; mount-table hiding is opt-in. The module loads after boot (service stage) with a panic guard, so a failure cannot keep the device from booting. Requires arm64 and a 6.6 GKI kernel that allows kretprobes and unsigned modules.
 updateJson=

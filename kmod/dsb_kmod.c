@@ -36,7 +36,8 @@
  *     /proc/<pid>/mountinfo and /proc/<pid>/mounts whose text mentions a
  *     root managed mount (source=magisk, /debug_ramdisk, /adb/modules/...).
  *     A line is discarded by rewinding seq_file->count to the value it had
- *     before the show callback appended anything.
+ *     before the show callback appended anything.  These two hooks touch a
+ *     kernel structure, so they are only registered with hide_mounts=1.
  *
  * Every hook is gated on the *caller* being an ordinary application
  * (uid >= 10000).  That covers normal apps, isolated processes and the
@@ -55,6 +56,7 @@
 #include <linux/fs.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
@@ -615,6 +617,20 @@ struct mnt_rec {
 static struct kretprobe kr_mountinfo;
 static struct kretprobe kr_mounts;
 
+/*
+ * Mount-table hiding is the only place where the module touches a kernel
+ * structure (seq_file->count).  It stays off unless the caller asks for it,
+ * so a device whose kernel differs from the build tree can never lose its
+ * mount tables just by loading the module.  Enable it with
+ *   insmod dsb_kmod.ko hide_mounts=1
+ * (the shipped service.sh does that when /data/adb/modules/dirtysepbypass/
+ * hide_mounts exists).
+ */
+static bool hide_mounts;
+module_param(hide_mounts, bool, 0644);
+MODULE_PARM_DESC(hide_mounts, "Hide root-managed mount lines from app mount tables");
+static bool mounts_registered;
+
 static int mnt_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct mnt_rec *r = (struct mnt_rec *)ri->data;
@@ -682,7 +698,7 @@ static void setup(struct kretprobe *kr, const char *sym,
 
 static int __init dsb_init(void)
 {
-	int ok = 0;
+	int ok = 0, total = 4;
 
 	setup(&kr_ctx, "security_context_to_sid", ctx_entry, ctx_ret,
 	      sizeof(struct ctx_rec), 64);
@@ -692,10 +708,6 @@ static int __init dsb_init(void)
 	      sizeof(struct ctx_rec), 32);
 	setup(&kr_access, "sel_write_access", acc_entry, acc_ret,
 	      sizeof(struct acc_rec), 32);
-	setup(&kr_mountinfo, "show_mountinfo", mnt_entry, mnt_ret,
-	      sizeof(struct mnt_rec), 64);
-	setup(&kr_mounts, "show_vfsmnt", mnt_entry, mnt_ret,
-	      sizeof(struct mnt_rec), 64);
 
 	if (!reg(&kr_ctx, "security_context_to_sid"))
 		ok++;
@@ -705,19 +717,35 @@ static int __init dsb_init(void)
 		ok++;
 	if (!reg(&kr_access, "sel_write_access"))
 		ok++;
+
+	if (!hide_mounts) {
+		pr_info(PFX "loaded, %d/4 selinux hooks active (mount hooks off)\n",
+			ok);
+		return 0;
+	}
+
+	total = 6;
+	setup(&kr_mountinfo, "show_mountinfo", mnt_entry, mnt_ret,
+	      sizeof(struct mnt_rec), 64);
+	setup(&kr_mounts, "show_vfsmnt", mnt_entry, mnt_ret,
+	      sizeof(struct mnt_rec), 64);
+
 	if (!reg(&kr_mountinfo, "show_mountinfo"))
 		ok++;
 	if (!reg(&kr_mounts, "show_vfsmnt"))
 		ok++;
+	mounts_registered = true;
 
-	pr_info(PFX "loaded, %d/6 hooks active\n", ok);
+	pr_info(PFX "loaded, %d/%d hooks active\n", ok, total);
 	return 0;
 }
 
 static void __exit dsb_exit(void)
 {
-	unregister_kretprobe(&kr_mounts);
-	unregister_kretprobe(&kr_mountinfo);
+	if (mounts_registered) {
+		unregister_kretprobe(&kr_mounts);
+		unregister_kretprobe(&kr_mountinfo);
+	}
 	unregister_kretprobe(&kr_access);
 	unregister_kretprobe(&kr_wrctx);
 	unregister_kretprobe(&kr_procattr);
