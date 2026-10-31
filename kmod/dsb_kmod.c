@@ -101,18 +101,16 @@ static void copy_nstr(char *dst, const void *src, size_t n, size_t cap)
 /* Substring search inside a NUL terminated string. */
 static bool has_substr(const char *hay, const char *needle)
 {
-	size_t n = 0, i, j;
+	size_t i, j;
 
-	while (needle[n])
-		n++;
-	if (!n)
+	if (!needle[0])
 		return false;
 	for (i = 0; hay[i]; i++) {
-		for (j = 0; j < n; j++) {
-			if (!hay[i + j] || hay[i + j] != needle[j])
+		for (j = 0; needle[j]; j++) {
+			if (hay[i + j] != needle[j])
 				break;
 		}
-		if (j == n)
+		if (!needle[j])
 			return true;
 	}
 	return false;
@@ -121,18 +119,16 @@ static bool has_substr(const char *hay, const char *needle)
 /* Substring search inside a bounded region (for seq_file buffers). */
 static bool has_substr_n(const char *hay, size_t len, const char *needle)
 {
-	size_t n = 0, i, j;
+	size_t i, j;
 
-	while (needle[n])
-		n++;
-	if (!n || len < n)
+	if (!needle[0])
 		return false;
-	for (i = 0; i + n <= len; i++) {
-		for (j = 0; j < n; j++) {
+	for (i = 0; i < len; i++) {
+		for (j = 0; needle[j] && i + j < len; j++) {
 			if (hay[i + j] != needle[j])
 				break;
 		}
-		if (j == n)
+		if (!needle[j])
 			return true;
 	}
 	return false;
